@@ -41,6 +41,7 @@ class CheckpointStore:
         self,
         estimate: StateEstimate,
         observations: Iterable[Observation] | None = None,
+        metadata: dict[str, object] | None = None,
     ) -> None:
         payload = {
             "time": estimate.time,
@@ -60,6 +61,7 @@ class CheckpointStore:
                 serialize_observation(item)
                 for item in (observations or [])
             ],
+            "metadata": metadata or {},
         }
         Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
 
@@ -83,6 +85,12 @@ class CheckpointStore:
             deserialize_observation(item) for item in payload.get("observations", [])
         ]
         return estimate, observations
+
+    def load_with_metadata(self) -> tuple[StateEstimate, list[Observation], dict[str, object]]:
+        payload = json.loads(Path(self.path).read_text(encoding="utf-8"))
+        estimate, observations = self.load()
+        metadata = payload.get("metadata", {})
+        return estimate, observations, metadata
 
 
 def serialize_observation(observation: Observation) -> dict[str, object]:

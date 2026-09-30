@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True, slots=True)
@@ -8,6 +8,7 @@ class Observation:
     time: float
     sensor: str
     sequence: int
+    arrival_time: float | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True, slots=True)

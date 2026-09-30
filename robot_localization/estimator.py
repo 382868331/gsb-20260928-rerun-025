@@ -143,16 +143,21 @@ class LocalizationEstimator:
             self.time = time
         return self.snapshot()
 
-    def step(self, observation: WheelObservation | ImuObservation) -> StateEstimate:
-        if observation.time < self.time - 1e-9:
+    def step(
+        self,
+        observation: WheelObservation | ImuObservation,
+        fusion_time: float | None = None,
+    ) -> StateEstimate:
+        event_time = observation.time if fusion_time is None else fusion_time
+        if event_time < self.time - 1e-9:
             raise ValueError("observations must be applied causally")
-        self.predict(observation.time)
+        self.predict(event_time)
         if isinstance(observation, WheelObservation):
             self._update_wheel(observation)
-            self.last_wheel_time = observation.time
+            self.last_wheel_time = event_time
         elif isinstance(observation, ImuObservation):
             self._update_imu(observation)
-            self.last_imu_time = observation.time
+            self.last_imu_time = event_time
         else:
             raise TypeError(f"unsupported observation type: {type(observation)!r}")
         return self.snapshot()

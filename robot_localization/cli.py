@@ -6,16 +6,23 @@ import json
 import math
 from pathlib import Path
 
+from dataclasses import asdict
+
+from .evaluation import compare_with_truth
 from .pipeline import LocalizationPipeline
 from .recording import CheckpointStore, JsonlRecorder
-from .sources import SyntheticScenarioSource
+from .sources import SyntheticScenarioSource, TimedDelayedScenarioSource
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run offline robot localization sample")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
+    parser.add_argument("--timed-calibration", action="store_true")
     args = parser.parse_args(argv)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.timed_calibration:
+        return _run_timed_calibration(args.output_dir)
 
     source = SyntheticScenarioSource()
     messages = source.observations()
@@ -71,6 +78,52 @@ def main(argv: list[str] | None = None) -> int:
         "degraded_samples": sum(1 for row in rows if row["degraded_reasons"]),
     }
     (args.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    print(json.dumps(metrics, indent=2))
+    return 0
+
+
+def _run_timed_calibration(output_dir: Path) -> int:
+    source = TimedDelayedScenarioSource()
+    messages = source.observations()
+    JsonlRecorder(output_dir / "messages.jsonl").write_many(messages)
+
+    def run(delay: float, checkpoint_path: Path | None = None):
+        pipeline = LocalizationPipeline(sensor_delays={"rear_wheels": delay})
+        for index, observation in enumerate(messages):
+            pipeline.add_observation(observation)
+            arrival = (
+                observation.arrival_time
+                if observation.arrival_time is not None
+                else observation.time
+            )
+            if arrival <= 10.0:
+                pipeline.process_until(arrival)
+            if checkpoint_path is not None and abs(arrival - 4.1) < 0.06:
+                checkpoint = pipeline.save_checkpoint()
+                CheckpointStore(checkpoint_path).save(
+                    checkpoint.state,
+                    pipeline.checkpoint_observations(),
+                    {
+                        "horizon": pipeline.horizon,
+                        "visible_arrival": pipeline.visible_arrival,
+                        "sealed_horizon": pipeline.sealed_horizon,
+                        "sensor_delays": pipeline.sensor_delays,
+                    },
+                )
+        return pipeline
+
+    uncorrected = run(0.0)
+    corrected = run(0.5, output_dir / "checkpoint.json")
+    truth = source.ground_truth()
+    uncorrected_metrics = compare_with_truth(uncorrected.outputs, truth)
+    corrected_metrics = compare_with_truth(corrected.outputs, truth)
+    metrics = {
+        "uncorrected": asdict(uncorrected_metrics),
+        "corrected": asdict(corrected_metrics),
+        "revision_records": [asdict(item) for item in corrected.revision_records],
+        "sealed_outputs": len(corrected.sealed_outputs),
+    }
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print(json.dumps(metrics, indent=2))
     return 0
 

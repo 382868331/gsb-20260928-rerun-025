@@ -124,5 +124,72 @@ class SyntheticScenarioSource:
         return 0.0
 
 
+class TimedDelayedScenarioSource:
+    """Known path with delayed wheel timestamps, an outage, burst replay, and slip."""
+
+    wheel_delay = 0.5
+
+    def __init__(self, seed: int = 17) -> None:
+        self.base = SyntheticScenarioSource(seed)
+
+    def ground_truth(self, dt: float = 0.02) -> list[GroundTruthPoint]:
+        return self.base.ground_truth(dt)
+
+    def observations(self) -> list[Observation]:
+        rng = np.random.default_rng(self.base.seed)
+        messages: list[Observation] = []
+        wheel_sequence = imu_sequence = 0
+        burst: list[Observation] = []
+        for point in self.ground_truth():
+            if point.time <= 0.0:
+                continue
+            if abs(point.time * 10.0 - round(point.time * 10.0)) < 1e-9:
+                observed_time = point.time + self.wheel_delay
+                in_outage = 2.0 <= point.time < 4.0
+                arrival = 4.2 if in_outage else observed_time
+                slip_offset = 0.7 if 6.0 <= point.time < 7.0 else 0.0
+                wheel = WheelObservation(
+                    time=observed_time,
+                    sensor="rear_wheels",
+                    sequence=wheel_sequence,
+                    arrival_time=arrival,
+                    linear_velocity=point.linear_velocity
+                    + slip_offset
+                    + float(rng.normal(0.0, 0.025)),
+                    yaw_rate=point.yaw_rate + float(rng.normal(0.0, 0.012)),
+                    linear_velocity_variance=0.01,
+                    yaw_rate_variance=0.004,
+                )
+                wheel_sequence += 1
+                if in_outage:
+                    burst.append(wheel)
+                elif abs(point.time - 5.0) < 1e-9:
+                    object.__setattr__(wheel, "arrival_time", 5.7)
+                    messages.append(wheel)
+                else:
+                    messages.append(wheel)
+            if abs(point.time * 20.0 - round(point.time * 20.0)) < 1e-9:
+                messages.append(
+                    ImuObservation(
+                        time=point.time,
+                        sensor="imu",
+                        sequence=imu_sequence,
+                        arrival_time=point.time,
+                        yaw_rate=point.yaw_rate + float(rng.normal(0.0, 0.015)),
+                        forward_acceleration=point.forward_acceleration
+                        + float(rng.normal(0.0, 0.035)),
+                        yaw_rate_variance=0.002,
+                        acceleration_variance=0.004,
+                    )
+                )
+                imu_sequence += 1
+        messages.sort(key=lambda item: (item.arrival_time or 0.0, item.sensor, item.sequence))
+        insert_at = next(
+            index
+            for index, item in enumerate(messages)
+            if item.arrival_time is not None and item.arrival_time >= 4.2
+        )
+        return messages[:insert_at] + burst + messages[insert_at:]
+
 def _normalize_angle(angle: float) -> float:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi

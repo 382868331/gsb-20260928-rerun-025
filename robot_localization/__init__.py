@@ -2,7 +2,14 @@
 
 from .calibration import DelayCalibration, SensorDelayModel
 from .estimator import LocalizationEstimator, StateEstimate
-from .pipeline import LocalizationPipeline, RecomputeReport, SealedHistoryError
+from .pipeline import (
+    DelayComparison,
+    DelaySettingView,
+    LocalizationPipeline,
+    ObservationDecision,
+    RecomputeReport,
+    SealedHistoryError,
+)
 from .recording import CheckpointStore, JsonlMessageSource, JsonlRecorder
 from .sources import SyntheticScenarioSource
 from .types import ImuObservation, Observation, WheelObservation
@@ -22,4 +29,7 @@ __all__ = [
     "SyntheticScenarioSource",
     "RecomputeReport",
     "SealedHistoryError",
+    "DelayComparison",
+    "DelaySettingView",
+    "ObservationDecision",
 ]

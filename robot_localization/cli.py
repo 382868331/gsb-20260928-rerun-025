@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 
 from .calibration import DelayCalibration
-from .pipeline import LocalizationPipeline, RecomputeReport, SealedHistoryError
+from .pipeline import Checkpoint, DelayComparison, LocalizationPipeline, RecomputeReport
 from .recording import CheckpointStore, JsonlRecorder
 from .sources import SyntheticScenarioSource
 
@@ -40,7 +40,8 @@ def main(argv: list[str] | None = None) -> int:
         calibration=DelayCalibration(INITIAL_GUESS)
     )
     recompute_events: list[dict[str, object]] = []
-    sealed_attempt: dict[str, object] | None = None
+    delay_comparison: dict[str, object] | None = None
+    discarded_revision: dict[str, object] | None = None
     saved_checkpoint = None
     boundary_at_checkpoint = None
     for index, observation in enumerate(messages):
@@ -67,12 +68,15 @@ def main(argv: list[str] | None = None) -> int:
             saved_checkpoint = pipeline.save_checkpoint()
             boundary_at_checkpoint = pipeline.visible_data_boundary()
 
-    # The user tries once more with a delay that touches the sealed interval,
-    # to demonstrate that sealed outputs cannot be silently replaced.
-    try:
-        pipeline.set_sensor_delay("rear_wheels", 0.45)
-    except SealedHistoryError as error:
-        sealed_attempt = _describe_sealed_error(error)
+    comparison = pipeline.stage_sensor_delay("rear_wheels", 0.45)
+    delay_comparison = _describe_comparison(comparison)
+    discarded_revision = {
+        "sensor": "rear_wheels",
+        "candidate_delay": 0.45,
+        "published": False,
+        "message": "候选校正尚未发布即撤销，当前轨迹和已发布延迟保持不变",
+    }
+    pipeline.discard_staged_delay()
 
     rows = []
     for point in truth:
@@ -111,12 +115,25 @@ def main(argv: list[str] | None = None) -> int:
         calibration=pipeline.calibration.as_dict(),
         arrival_horizon=checkpoint.arrival_horizon,
         seal_time=pipeline.seal_time,
+        sealed_outputs=checkpoint.sealed_outputs,
+        rejected_observations=checkpoint.rejected_observations,
     )
 
     # Restore must present exactly the same visible data boundary: a message
     # received after the checkpoint stays hidden until its arrival time.
+    loaded_state, loaded_observations, metadata = checkpoint_store.load_with_metadata()
+    loaded_checkpoint = Checkpoint(
+        state=loaded_state,
+        event_count=len(metadata["sealed_outputs"]),
+        arrival_horizon=metadata["arrival_horizon"],
+        seal_time=metadata["seal_time"],
+        calibration=DelayCalibration(metadata["fixed_delays"]),
+        visible_observations=loaded_observations,
+        sealed_outputs=metadata["sealed_outputs"],
+        rejected_observations=metadata["rejected_observations"],
+    )
     restored = LocalizationPipeline()
-    restored.restore_checkpoint(checkpoint)
+    restored.restore_checkpoint(loaded_checkpoint)
     boundary_after = restored.visible_data_boundary()
 
     metrics = _metrics(rows, pipeline)
@@ -126,7 +143,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     metrics["rmse_position_uncorrected"] = raw_rmse
     metrics["delay_recompute"] = recompute_events
-    metrics["sealed_rejected_update"] = sealed_attempt
+    metrics["delay_setting_comparison"] = delay_comparison
+    metrics["discarded_unpublished_revision"] = discarded_revision
     metrics["visible_boundary_before_restore"] = boundary_at_checkpoint
     metrics["visible_boundary_after_restore"] = boundary_after
     metrics["restore_preserves_boundary"] = boundary_at_checkpoint == boundary_after
@@ -173,15 +191,50 @@ def _describe_report(report: RecomputeReport) -> dict[str, object]:
         "affected_interval": [report.affected_from, report.affected_to],
         "recomputed_from": report.recomputed_from,
         "sealed_blocked_times": list(report.sealed_blocked),
+        "boundary_state_time": report.boundary_state_time,
+        "adopted_observations": list(report.adopted_observations),
+        "rejected_observations": [
+            _describe_decision(item) for item in report.rejected_observations
+        ],
     }
 
 
-def _describe_sealed_error(error: SealedHistoryError) -> dict[str, object]:
+def _describe_comparison(comparison: DelayComparison) -> dict[str, object]:
     return {
-        "sensor": error.sensor,
-        "attempted_interval": list(error.affected_interval),
-        "sealed_times": error.sealed_times,
-        "message": str(error),
+        "sensor": comparison.sensor,
+        "recomputable_range": list(comparison.recomputable_range or []),
+        "sealed_history": list(comparison.sealed_history or []),
+        "boundary_state_time": comparison.boundary_state_time,
+        "settings": {
+            "baseline": _describe_setting(comparison.baseline),
+            "candidate": _describe_setting(comparison.candidate),
+        },
+        "observations": [
+            _describe_decision(item) for item in comparison.decisions
+        ],
+    }
+
+
+def _describe_setting(setting) -> dict[str, object]:
+    return {
+        "delay": setting.delay,
+        "corrected_interval": list(setting.corrected_interval or []),
+        "affected_observations": list(setting.affected_sequences),
+        "open_observations": list(setting.open_sequences),
+        "sealed_observations": list(setting.sealed_sequences),
+        "rejected_observations": list(setting.rejected_sequences),
+    }
+
+
+def _describe_decision(decision) -> dict[str, object]:
+    return {
+        "sensor": decision.sensor,
+        "sequence": decision.sequence,
+        "stamp": decision.stamp,
+        "arrival_time": decision.arrival_time,
+        "candidate_corrected_time": decision.corrected_time,
+        "classification": decision.classification,
+        "reason": decision.reason,
     }
 
 

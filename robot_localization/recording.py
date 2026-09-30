@@ -44,6 +44,8 @@ class CheckpointStore:
         calibration: dict[str, float] | None = None,
         arrival_horizon: float | None = None,
         seal_time: float | None = None,
+        sealed_outputs: list[StateEstimate] | None = None,
+        rejected_observations: dict[tuple[str, int], str] | None = None,
     ) -> None:
         payload = {
             "time": estimate.time,
@@ -66,10 +68,24 @@ class CheckpointStore:
             "arrival_horizon": arrival_horizon,
             "seal_time": seal_time,
             "fixed_delays": calibration or {},
+            "sealed_outputs": [
+                serialize_state(item)
+                for item in (sealed_outputs or [])
+            ],
+            "rejected_observations": [
+                {
+                    "sensor": sensor,
+                    "sequence": sequence,
+                    "reason": reason,
+                }
+                for (sensor, sequence), reason in (rejected_observations or {}).items()
+            ],
         }
         Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
 
-    def load(self) -> tuple[StateEstimate, list[Observation]]:
+    def load_with_metadata(
+        self,
+    ) -> tuple[StateEstimate, list[Observation], dict[str, object]]:
         payload = json.loads(Path(self.path).read_text(encoding="utf-8"))
         mean = payload["mean"]
         estimate = StateEstimate(
@@ -88,7 +104,58 @@ class CheckpointStore:
         observations = [
             deserialize_observation(item) for item in payload.get("observations", [])
         ]
+        metadata = {
+            "arrival_horizon": payload.get("arrival_horizon"),
+            "seal_time": payload.get("seal_time"),
+            "fixed_delays": payload.get("fixed_delays", {}),
+            "sealed_outputs": [
+                deserialize_state(item) for item in payload.get("sealed_outputs", [])
+            ],
+            "rejected_observations": {
+                (item["sensor"], item["sequence"]): item["reason"]
+                for item in payload.get("rejected_observations", [])
+            },
+        }
+        return estimate, observations, metadata
+
+    def load(self) -> tuple[StateEstimate, list[Observation]]:
+        estimate, observations, _ = self.load_with_metadata()
         return estimate, observations
+
+
+def serialize_state(estimate: StateEstimate) -> dict[str, object]:
+    return {
+        "time": estimate.time,
+        "mean": [
+            estimate.x,
+            estimate.y,
+            estimate.heading,
+            estimate.linear_velocity,
+            estimate.yaw_rate,
+            estimate.forward_acceleration,
+        ],
+        "covariance": estimate.covariance.tolist(),
+        "last_wheel_time": estimate.last_wheel_time,
+        "last_imu_time": estimate.last_imu_time,
+        "degraded_reasons": sorted(estimate.degraded_reasons),
+    }
+
+
+def deserialize_state(payload: dict[str, object]) -> StateEstimate:
+    mean = payload["mean"]
+    return StateEstimate(
+        time=float(payload["time"]),
+        x=float(mean[0]),
+        y=float(mean[1]),
+        heading=float(mean[2]),
+        linear_velocity=float(mean[3]),
+        yaw_rate=float(mean[4]),
+        forward_acceleration=float(mean[5]),
+        covariance=np.asarray(payload["covariance"], dtype=float),
+        last_wheel_time=payload.get("last_wheel_time"),
+        last_imu_time=payload.get("last_imu_time"),
+        degraded_reasons=set(payload.get("degraded_reasons", [])),
+    )
 
 
 def serialize_observation(observation: Observation) -> dict[str, object]:

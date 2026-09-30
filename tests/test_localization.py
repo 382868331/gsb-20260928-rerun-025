@@ -243,8 +243,6 @@ class DelayCalibrationTests(unittest.TestCase):
         self.assertLess(corrected, 0.5 * uncorrected)
 
     def test_changing_delay_recomputes_only_open_interval(self) -> None:
-        from robot_localization.pipeline import SealedHistoryError
-
         source = delayed_source()
         pipeline = LocalizationPipeline(
             calibration=DelayCalibration({"rear_wheels": 0.10, "imu": 0.12})
@@ -261,34 +259,168 @@ class DelayCalibrationTests(unittest.TestCase):
         self.assertIsNotNone(report)
         self.assertEqual(report.sensor, "rear_wheels")
         self.assertAlmostEqual(report.new_delay, 0.30)
-        self.assertEqual(report.recomputed_from, 0.0)
+        self.assertAlmostEqual(report.recomputed_from, 0.1)
         self.assertFalse(report.sealed_blocked)
-        sealed_values = [state.x for state in pipeline.sealed_outputs]
-        with self.assertRaises(SealedHistoryError):
-            pipeline.set_sensor_delay("rear_wheels", 0.45)
-        # Sealed outputs remain byte-for-byte stable; only the open tail
-        # could be recomputed.
-        self.assertEqual([state.x for state in pipeline.sealed_outputs], sealed_values)
+        self.assertIsNone(report.boundary_state_time)
 
-    def test_delay_change_touching_sealed_output_is_rejected(self) -> None:
-        from robot_localization.pipeline import SealedHistoryError
-
+    def test_delay_change_keeps_sealed_history_and_recomputes_open_tail(self) -> None:
         source = delayed_source()
         pipeline = LocalizationPipeline(
             calibration=DelayCalibration({"rear_wheels": 0.10, "imu": 0.12})
         )
-        sealed_value = None
+        sealed_before = {}
+        open_before = {}
         for message in source.observations():
             pipeline.add_observation(message)
             pipeline.process_until(message.observed_at())
             if pipeline.seal_time is None and message.observed_at() >= 5.3:
                 pipeline.seal_until(5.0)
-                sealed_value = pipeline.sealed_outputs[-1].x
-        with self.assertRaises(SealedHistoryError) as context:
-            pipeline.set_sensor_delay("rear_wheels", 0.45)
-        self.assertTrue(context.exception.sealed_times)
-        # Sealed outputs are untouched after the rejected update.
-        self.assertEqual(pipeline.sealed_outputs[-1].x, sealed_value)
+                sealed_before = {
+                    round(state.time, 6): (state.x, state.y)
+                    for state in pipeline.sealed_outputs
+                }
+                open_before = {
+                    round(state.time, 6): (state.x, state.y)
+                    for state in pipeline.outputs
+                }
+        comparison = pipeline.stage_sensor_delay("rear_wheels", 0.45)
+        self.assertEqual(comparison.sealed_history, (0.0, 5.0))
+        self.assertEqual(comparison.boundary_state_time, 5.0)
+        self.assertTrue(comparison.candidate.open_sequences)
+        self.assertTrue(comparison.candidate.sealed_sequences)
+        self.assertTrue(
+            any(
+                item.classification == "crossing_rejected"
+                for item in comparison.decisions
+            )
+        )
+        self.assertTrue(
+            any(item.classification == "open_recomputed" for item in comparison.decisions)
+        )
+        report = pipeline.publish_staged_delay()
+        self.assertEqual(report.boundary_state_time, 5.0)
+        self.assertTrue(report.rejected_observations)
+        self.assertEqual(
+            {
+                round(state.time, 6): (state.x, state.y)
+                for state in pipeline.sealed_outputs
+            },
+            sealed_before,
+        )
+        open_after = {
+            round(state.time, 6): (state.x, state.y)
+            for state in pipeline.outputs
+        }
+        self.assertNotEqual(open_after, open_before)
+
+    def test_unpublished_correction_can_be_discarded(self) -> None:
+        source = delayed_source()
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"rear_wheels": 0.30, "imu": 0.12})
+        )
+        for message in source.observations():
+            pipeline.add_observation(message)
+            pipeline.process_until(message.observed_at())
+            if pipeline.seal_time is None and message.observed_at() >= 5.3:
+                pipeline.seal_until(5.0)
+        before = [(state.time, state.x, state.y) for state in pipeline.all_outputs()]
+        pipeline.stage_sensor_delay("rear_wheels", 0.45)
+        pipeline.discard_staged_delay()
+        self.assertEqual(pipeline.calibration.delay_for("rear_wheels"), 0.30)
+        self.assertEqual(
+            [(state.time, state.x, state.y) for state in pipeline.all_outputs()],
+            before,
+        )
+        self.assertFalse(pipeline.rejected_observations)
+
+    def test_reseal_save_restore_preserve_timeline(self) -> None:
+        source = delayed_source()
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"rear_wheels": 0.30, "imu": 0.12})
+        )
+        for message in source.observations():
+            pipeline.add_observation(message)
+            pipeline.process_until(message.observed_at())
+            if pipeline.seal_time is None and message.observed_at() >= 5.3:
+                pipeline.seal_until(5.0)
+        pipeline.seal_until(6.0)
+        checkpoint = pipeline.save_checkpoint()
+        expected = [
+            (state.time, state.x, state.y, state.heading)
+            for state in pipeline.all_outputs()
+        ]
+        restored = LocalizationPipeline()
+        restored.restore_checkpoint(checkpoint)
+        actual = [
+            (state.time, state.x, state.y, state.heading)
+            for state in restored.all_outputs()
+        ]
+        np.testing.assert_allclose(
+            np.asarray(actual, dtype=float),
+            np.asarray(expected, dtype=float),
+            atol=1e-12,
+        )
+        self.assertEqual(restored.seal_time, 6.0)
+        self.assertEqual(
+            restored.visible_data_boundary(),
+            pipeline.visible_data_boundary(),
+        )
+
+    def test_file_checkpoint_restore_preserves_sealed_timeline(self) -> None:
+        source = delayed_source()
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"rear_wheels": 0.30, "imu": 0.12})
+        )
+        cutoff = None
+        for index, message in enumerate(source.observations()):
+            pipeline.add_observation(message)
+            pipeline.process_until(message.observed_at())
+            if pipeline.seal_time is None and message.observed_at() >= 5.3:
+                pipeline.seal_until(5.0)
+            if index == len(source.observations()) - 25:
+                cutoff = index
+                checkpoint = pipeline.save_checkpoint()
+        self.assertIsNotNone(cutoff)
+        expected = [
+            (state.time, state.x, state.y, state.heading)
+            for state in pipeline.all_outputs()
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            CheckpointStore(path).save(
+                checkpoint.state,
+                checkpoint.visible_observations,
+                calibration=checkpoint.calibration.as_dict(),
+                arrival_horizon=checkpoint.arrival_horizon,
+                seal_time=checkpoint.seal_time,
+                sealed_outputs=checkpoint.sealed_outputs,
+                rejected_observations=checkpoint.rejected_observations,
+            )
+            state, observations, metadata = CheckpointStore(path).load_with_metadata()
+            loaded_checkpoint = type(checkpoint)(
+                state=state,
+                event_count=len(metadata["sealed_outputs"]),
+                arrival_horizon=metadata["arrival_horizon"],
+                seal_time=metadata["seal_time"],
+                calibration=DelayCalibration(metadata["fixed_delays"]),
+                visible_observations=observations,
+                sealed_outputs=metadata["sealed_outputs"],
+                rejected_observations=metadata["rejected_observations"],
+            )
+        resumed = LocalizationPipeline()
+        resumed.restore_checkpoint(loaded_checkpoint)
+        for message in source.observations()[cutoff + 1 :]:
+            resumed.add_observation(message)
+            resumed.process_until(message.observed_at())
+        actual = [
+            (state.time, state.x, state.y, state.heading)
+            for state in resumed.all_outputs()
+        ]
+        np.testing.assert_allclose(
+            np.asarray(actual, dtype=float),
+            np.asarray(expected, dtype=float),
+            atol=1e-10,
+        )
 
     def test_backfill_burst_never_moves_live_state_backwards(self) -> None:
         source = delayed_source()

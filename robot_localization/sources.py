@@ -25,10 +25,26 @@ class GroundTruthPoint:
 
 
 class SyntheticScenarioSource:
-    """Deterministic fictional sensor data: acceleration, a 90-degree turn, slip, gaps."""
+    """Deterministic fictional sensor data: acceleration, a turn, slip, gaps.
 
-    def __init__(self, seed: int = 7) -> None:
+    With ``fixed_delays`` unset the source is the original raw stream (no
+    arrival timestamps).  With delays provided, every message keeps its stamp
+    and gains a separate arrival time; the wheel stream suffers a sustained
+    outage whose samples arrive later as an ordered burst (backfill).
+    """
+
+    WHEEL_OUTAGE = (6.8, 7.7)
+    WHEEL_BACKFILL_ARRIVAL = 7.95
+
+    def __init__(
+        self,
+        seed: int = 7,
+        fixed_delays: dict[str, float] | None = None,
+        arrival_jitter: float = 0.02,
+    ) -> None:
         self.seed = seed
+        self.fixed_delays = fixed_delays
+        self.arrival_jitter = arrival_jitter
 
     def ground_truth(self, dt: float = 0.02) -> list[GroundTruthPoint]:
         points: list[GroundTruthPoint] = []
@@ -64,36 +80,61 @@ class SyntheticScenarioSource:
         rng = np.random.default_rng(self.seed)
         truth = self.ground_truth()
         messages: list[Observation] = []
+        physical_times: dict[tuple[str, int], float] = {}
         wheel_sequence = imu_sequence = 0
+        delayed = self.fixed_delays is not None
         for point in truth:
+            physical_time = point.time
             time = point.time
             if abs((time * 10.0) - round(time * 10.0)) < 1e-9 and time > 0.0:
-                if not (6.8 < time < 7.4):  # short wheel outage during/after slip
+                outage_start, outage_end = self.WHEEL_OUTAGE
+                legacy_gap = not delayed and outage_start < time < 7.4
+                if not legacy_gap:
                     slip_offset = 0.65 if 6.0 <= time < 8.0 else 0.0
                     wheel_velocity = (
                         point.linear_velocity
                         + slip_offset
                         + float(rng.normal(0.0, 0.035))
                     )
+                    arrival = None
+                    stamped_time = time
+                    if delayed:
+                        delay = self.fixed_delays.get("rear_wheels", 0.0)
+                        jitter = float(rng.uniform(-self.arrival_jitter, self.arrival_jitter))
+                        arrival = time + delay + abs(jitter)
+                        if outage_start <= time < outage_end:
+                            arrival = self.WHEEL_BACKFILL_ARRIVAL + wheel_sequence * 0.002
+                        # Stamp is assigned on receipt; corrected time = stamp - delay.
+                        stamped_time = arrival - abs(jitter)
                     messages.append(
                         WheelObservation(
-                            time=time,
+                            time=stamped_time,
                             sensor="rear_wheels",
                             sequence=wheel_sequence,
+                            arrival_time=arrival,
                             linear_velocity=wheel_velocity,
                             yaw_rate=point.yaw_rate + float(rng.normal(0.0, 0.015)),
                             linear_velocity_variance=0.01,
                             yaw_rate_variance=0.004,
                         )
                     )
+                    physical_times[("rear_wheels", wheel_sequence)] = physical_time
                     wheel_sequence += 1
             if abs((time * 20.0) - round(time * 20.0)) < 1e-9 and time > 0.0:
-                if not (7.1 < time < 7.7):  # short IMU outage
+                if delayed or not (7.1 < time < 7.7):  # short IMU outage
+                    arrival = None
+                    stamped_time = time
+                    if delayed:
+                        delay = self.fixed_delays.get("imu", 0.0)
+                        jitter = float(rng.uniform(-self.arrival_jitter, self.arrival_jitter))
+                        arrival = time + delay + abs(jitter)
+                        stamped_time = arrival - abs(jitter)
                     messages.append(
                         ImuObservation(
-                            time=time,
+                            time=stamped_time,
                             sensor="imu",
                             sequence=imu_sequence,
+                            arrival_time=arrival,
                             yaw_rate=point.yaw_rate + float(rng.normal(0.0, 0.018)),
                             forward_acceleration=point.forward_acceleration
                             + float(rng.normal(0.0, 0.04)),
@@ -101,14 +142,34 @@ class SyntheticScenarioSource:
                             acceleration_variance=0.004,
                         )
                     )
+                    physical_times[("imu", imu_sequence)] = physical_time
                     imu_sequence += 1
-        # A wheel sample from the turn arrives after some later messages. It must
-        # be withheld until arrival, then trigger rollback rather than being
-        # silently ignored or applied to the newest timestamp.
-        late = next(item for item in messages if isinstance(item, WheelObservation) and 4.8 <= item.time <= 5.2)
+        # One wheel sample from the turn arrives badly out of order. It must be
+        # withheld until arrival, then revise history rather than being stamped
+        # with the newest time.
+        late = next(
+            item
+            for item in messages
+            if isinstance(item, WheelObservation)
+            and 4.8 <= physical_times[(item.sensor, item.sequence)] <= 5.2
+        )
         messages.remove(late)
-        insertion = min(len(messages), 70)
-        messages.insert(insertion, late)
+        if delayed:
+            delay = self.fixed_delays.get("rear_wheels", 0.0)
+            late = WheelObservation(
+                time=late.time,
+                sensor=late.sensor,
+                sequence=late.sequence,
+                arrival_time=late.time + 1.6,
+                linear_velocity=late.linear_velocity,
+                yaw_rate=late.yaw_rate,
+                linear_velocity_variance=late.linear_velocity_variance,
+                yaw_rate_variance=late.yaw_rate_variance,
+            )
+            messages.sort(key=lambda item: item.observed_at())
+        else:
+            insertion = min(len(messages), 70)
+            messages.insert(insertion, late)
         return messages
 
     @staticmethod

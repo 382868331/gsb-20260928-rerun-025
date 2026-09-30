@@ -41,6 +41,9 @@ class CheckpointStore:
         self,
         estimate: StateEstimate,
         observations: Iterable[Observation] | None = None,
+        calibration: dict[str, float] | None = None,
+        arrival_horizon: float | None = None,
+        seal_time: float | None = None,
     ) -> None:
         payload = {
             "time": estimate.time,
@@ -60,6 +63,9 @@ class CheckpointStore:
                 serialize_observation(item)
                 for item in (observations or [])
             ],
+            "arrival_horizon": arrival_horizon,
+            "seal_time": seal_time,
+            "fixed_delays": calibration or {},
         }
         Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
 

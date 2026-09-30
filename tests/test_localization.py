@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from robot_localization.estimator import LocalizationEstimator
+from robot_localization.calibration import DelayCalibration
 from robot_localization.pipeline import LocalizationPipeline
 from robot_localization.recording import (
     CheckpointStore,
@@ -15,6 +16,23 @@ from robot_localization.recording import (
 )
 from robot_localization.sources import SyntheticScenarioSource
 from robot_localization.types import ImuObservation, WheelObservation
+
+
+TRUE_DELAYS = {"rear_wheels": 0.30, "imu": 0.12}
+
+
+def delayed_source() -> SyntheticScenarioSource:
+    return SyntheticScenarioSource(fixed_delays=TRUE_DELAYS)
+
+
+def run_online(source: SyntheticScenarioSource, calibration: DelayCalibration | None = None):
+    pipeline = LocalizationPipeline(calibration=calibration)
+    live_times = []
+    for message in source.observations():
+        pipeline.add_observation(message)
+        pipeline.process_until(message.observed_at())
+        live_times.append(pipeline.state().time)
+    return pipeline, live_times
 
 
 class EstimatorTests(unittest.TestCase):
@@ -197,6 +215,122 @@ class ScenarioTests(unittest.TestCase):
         self.assertLess(position_error, 0.25)
         self.assertLess(heading_error, 0.08)
         self.assertTrue(slip_events)
+
+
+class DelayCalibrationTests(unittest.TestCase):
+    def test_stamp_and_arrival_are_retained_separately(self) -> None:
+        source = delayed_source()
+        delayed_messages = [m for m in source.observations() if m.arrival_time is not None]
+        self.assertTrue(delayed_messages)
+        for message in delayed_messages:
+            self.assertGreaterEqual(message.arrival_time, message.time - 1e-9)
+
+    def test_delay_correction_reduces_known_path_error(self) -> None:
+        source = delayed_source()
+        truth = {round(point.time, 3): point for point in source.ground_truth()}
+
+        def rmse(calibration: DelayCalibration | None) -> float:
+            pipeline, _ = run_online(source, calibration)
+            errors = []
+            for output in pipeline.all_outputs():
+                point = min(truth.values(), key=lambda item: abs(item.time - output.time))
+                if abs(point.time - output.time) < 0.03:
+                    errors.append(math.hypot(output.x - point.x, output.y - point.y) ** 2)
+            return math.sqrt(sum(errors) / len(errors))
+
+        corrected = rmse(DelayCalibration(TRUE_DELAYS))
+        uncorrected = rmse(DelayCalibration())
+        self.assertLess(corrected, 0.5 * uncorrected)
+
+    def test_changing_delay_recomputes_only_open_interval(self) -> None:
+        from robot_localization.pipeline import SealedHistoryError
+
+        source = delayed_source()
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"rear_wheels": 0.10, "imu": 0.12})
+        )
+        messages = source.observations()
+        report = None
+        for message in messages:
+            pipeline.add_observation(message)
+            pipeline.process_until(message.observed_at())
+            if report is None and message.observed_at() >= 2.6:
+                report = pipeline.set_sensor_delay("rear_wheels", 0.30)
+            if pipeline.seal_time is None and message.observed_at() >= 5.3:
+                pipeline.seal_until(5.0)
+        self.assertIsNotNone(report)
+        self.assertEqual(report.sensor, "rear_wheels")
+        self.assertAlmostEqual(report.new_delay, 0.30)
+        self.assertEqual(report.recomputed_from, 0.0)
+        self.assertFalse(report.sealed_blocked)
+        sealed_values = [state.x for state in pipeline.sealed_outputs]
+        with self.assertRaises(SealedHistoryError):
+            pipeline.set_sensor_delay("rear_wheels", 0.45)
+        # Sealed outputs remain byte-for-byte stable; only the open tail
+        # could be recomputed.
+        self.assertEqual([state.x for state in pipeline.sealed_outputs], sealed_values)
+
+    def test_delay_change_touching_sealed_output_is_rejected(self) -> None:
+        from robot_localization.pipeline import SealedHistoryError
+
+        source = delayed_source()
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"rear_wheels": 0.10, "imu": 0.12})
+        )
+        sealed_value = None
+        for message in source.observations():
+            pipeline.add_observation(message)
+            pipeline.process_until(message.observed_at())
+            if pipeline.seal_time is None and message.observed_at() >= 5.3:
+                pipeline.seal_until(5.0)
+                sealed_value = pipeline.sealed_outputs[-1].x
+        with self.assertRaises(SealedHistoryError) as context:
+            pipeline.set_sensor_delay("rear_wheels", 0.45)
+        self.assertTrue(context.exception.sealed_times)
+        # Sealed outputs are untouched after the rejected update.
+        self.assertEqual(pipeline.sealed_outputs[-1].x, sealed_value)
+
+    def test_backfill_burst_never_moves_live_state_backwards(self) -> None:
+        source = delayed_source()
+        pipeline, live_times = run_online(
+            source, DelayCalibration(TRUE_DELAYS)
+        )
+        self.assertEqual(live_times, sorted(live_times))
+        # The wheel outage degrades the live estimate while the gap is open.
+        gap_states = [
+            state
+            for state in pipeline.all_outputs()
+            if 7.1 <= state.time <= 7.6
+        ]
+        self.assertTrue(
+            any("wheel_stream_gap" in state.degraded_reasons for state in gap_states)
+        )
+        # Uncertainty expanded during the outage instead of staying constant.
+        radii = [state.position_95_radius for state in gap_states]
+        self.assertGreater(max(radii), radii[0])
+        # After the burst arrives, history was revised but the live clock did
+        # not jump to an old timestamp.
+        self.assertGreaterEqual(pipeline.state().time, max(live_times) - 1e-9)
+
+    def test_restore_keeps_the_same_visible_data_boundary(self) -> None:
+        source = delayed_source()
+        messages = source.observations()
+        pipeline = LocalizationPipeline(calibration=DelayCalibration(TRUE_DELAYS))
+        cutoff = len(messages) - 25
+        boundary_at_checkpoint = None
+        for index, message in enumerate(messages):
+            pipeline.add_observation(message)
+            pipeline.process_until(message.observed_at())
+            if index == cutoff:
+                checkpoint = pipeline.save_checkpoint()
+                prior = pipeline.checkpoint_observations()
+                boundary_at_checkpoint = pipeline.visible_data_boundary()
+        restored = LocalizationPipeline()
+        restored.restore_checkpoint(checkpoint, prior)
+        after = restored.visible_data_boundary()
+        self.assertEqual(boundary_at_checkpoint, after)
+        # Messages that arrived after the checkpoint stay hidden.
+        self.assertEqual(len(restored.received), len(prior))
 
 
 if __name__ == "__main__":

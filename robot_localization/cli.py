@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 
 from .calibration import DelayCalibration
-from .pipeline import LocalizationPipeline, RecomputeReport, SealedHistoryError
+from .pipeline import LocalizationPipeline, RecomputeReport
 from .recording import CheckpointStore, JsonlRecorder
 from .sources import SyntheticScenarioSource
 
@@ -41,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     recompute_events: list[dict[str, object]] = []
     sealed_attempt: dict[str, object] | None = None
+    delay_comparison: list[dict[str, object]] | None = None
     saved_checkpoint = None
     boundary_at_checkpoint = None
     for index, observation in enumerate(messages):
@@ -69,10 +70,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # The user tries once more with a delay that touches the sealed interval,
     # to demonstrate that sealed outputs cannot be silently replaced.
-    try:
-        pipeline.set_sensor_delay("rear_wheels", 0.45)
-    except SealedHistoryError as error:
-        sealed_attempt = _describe_sealed_error(error)
+    left, right = pipeline.compare_delay_settings("rear_wheels", 0.30, 0.45)
+    delay_comparison = [_describe_report(left), _describe_report(right)]
+    partial_report = pipeline.set_sensor_delay("rear_wheels", 0.45)
+    sealed_attempt = _describe_report(partial_report)
 
     rows = []
     for point in truth:
@@ -105,18 +106,13 @@ def main(argv: list[str] | None = None) -> int:
 
     checkpoint = saved_checkpoint or pipeline.save_checkpoint()
     checkpoint_store = CheckpointStore(args.output_dir / "checkpoint.json")
-    checkpoint_store.save(
-        checkpoint.state,
-        checkpoint.visible_observations,
-        calibration=pipeline.calibration.as_dict(),
-        arrival_horizon=checkpoint.arrival_horizon,
-        seal_time=pipeline.seal_time,
-    )
+    checkpoint_store.save_pipeline_checkpoint(checkpoint)
 
     # Restore must present exactly the same visible data boundary: a message
     # received after the checkpoint stays hidden until its arrival time.
     restored = LocalizationPipeline()
-    restored.restore_checkpoint(checkpoint)
+    loaded_checkpoint = checkpoint_store.load_pipeline_checkpoint()
+    restored.restore_checkpoint(loaded_checkpoint)
     boundary_after = restored.visible_data_boundary()
 
     metrics = _metrics(rows, pipeline)
@@ -126,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     metrics["rmse_position_uncorrected"] = raw_rmse
     metrics["delay_recompute"] = recompute_events
+    metrics["delay_setting_comparison"] = delay_comparison
     metrics["sealed_rejected_update"] = sealed_attempt
     metrics["visible_boundary_before_restore"] = boundary_at_checkpoint
     metrics["visible_boundary_after_restore"] = boundary_after
@@ -172,16 +169,24 @@ def _describe_report(report: RecomputeReport) -> dict[str, object]:
         "new_delay": report.new_delay,
         "affected_interval": [report.affected_from, report.affected_to],
         "recomputed_from": report.recomputed_from,
+        "recomputed_to": report.recomputed_to,
         "sealed_blocked_times": list(report.sealed_blocked),
-    }
-
-
-def _describe_sealed_error(error: SealedHistoryError) -> dict[str, object]:
-    return {
-        "sensor": error.sensor,
-        "attempted_interval": list(error.affected_interval),
-        "sealed_times": error.sealed_times,
-        "message": str(error),
+        "immutable_history_times": list(report.immutable_history),
+        "affected_observations": [
+            {
+                "sensor": item.sensor,
+                "sequence": item.sequence,
+                "stamp_time": item.stamp_time,
+                "arrival_time": item.arrival_time,
+                "old_corrected_time": item.old_corrected_time,
+                "new_corrected_time": item.new_corrected_time,
+                "action": item.action,
+                "reason": item.reason,
+            }
+            for item in report.affected_observations
+        ],
+        "accepted_count": len(report.accepted_observations),
+        "rejected_count": len(report.rejected_observations),
     }
 
 

@@ -7,6 +7,18 @@ from .estimator import LocalizationEstimator, StateEstimate
 from .types import Observation
 
 
+@dataclass(frozen=True, slots=True)
+class ObservationImpact:
+    sensor: str
+    sequence: int
+    stamp_time: float
+    arrival_time: float | None
+    old_corrected_time: float
+    new_corrected_time: float
+    action: str
+    reason: str
+
+
 @dataclass(slots=True)
 class Checkpoint:
     state: StateEstimate
@@ -15,6 +27,11 @@ class Checkpoint:
     seal_time: float | None = None
     calibration: DelayCalibration | None = None
     visible_observations: list[Observation] = field(default_factory=list)
+    sealed_at_arrival: float | None = None
+    pending_corrections: list[tuple[str, float, float]] = field(default_factory=list)
+    rejected_observations: list[ObservationImpact] = field(default_factory=list)
+    held_observation_keys: list[tuple[str, int, float | None]] = field(default_factory=list)
+    sealed_outputs: list[StateEstimate] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +43,11 @@ class RecomputeReport:
     affected_to: float
     recomputed_from: float
     sealed_blocked: tuple[float, ...]
+    recomputed_to: float | None = None
+    immutable_history: tuple[float, ...] = ()
+    affected_observations: tuple[ObservationImpact, ...] = ()
+    rejected_observations: tuple[ObservationImpact, ...] = ()
+    accepted_observations: tuple[ObservationImpact, ...] = ()
 
 
 class SealedHistoryError(RuntimeError):
@@ -68,8 +90,14 @@ class LocalizationPipeline:
         self.checkpoints: list[Checkpoint] = []
         self.arrival_horizon: float | None = None
         self.seal_time: float | None = None
+        self.sealed_at_arrival: float | None = None
         self.sealed_outputs: list[StateEstimate] = []
         self.outputs: list[StateEstimate] = []
+        self.held_observation_keys: set[tuple[str, int, float | None]] = set()
+        self.late_rejected_observations: dict[
+            tuple[str, int, float | None], ObservationImpact
+        ] = {}
+        self.pending_corrections: list[tuple[str, float, float]] = []
 
     # ------------------------------------------------------------------ ingest
 
@@ -101,6 +129,11 @@ class LocalizationPipeline:
                 self.seal_time,
                 self.calibration,
                 self._visible(arrival_horizon),
+                self.sealed_at_arrival,
+                list(self.pending_corrections),
+                list(self.late_rejected_observations.values()),
+                list(self.held_observation_keys),
+                list(self.sealed_outputs),
             )
         )
         return list(self.outputs)
@@ -115,9 +148,12 @@ class LocalizationPipeline:
         keep = [output for output in combined if output.time <= time + 1e-9]
         self.sealed_outputs = keep
         self.seal_time = keep[-1].time if keep else time
+        self.sealed_at_arrival = self.arrival_horizon
         self.outputs = [
             output for output in combined if output.time > self.seal_time + 1e-9
         ]
+        self.pending_corrections.clear()
+        self._rebuild_tail()
         self._trim_checkpoints()
         self.checkpoints.append(
             Checkpoint(
@@ -127,6 +163,11 @@ class LocalizationPipeline:
                 self.seal_time,
                 self.calibration,
                 self._visible(self.arrival_horizon),
+                self.sealed_at_arrival,
+                list(self.pending_corrections),
+                list(self.late_rejected_observations.values()),
+                list(self.held_observation_keys),
+                list(self.sealed_outputs),
             )
         )
         return list(self.sealed_outputs)
@@ -135,40 +176,163 @@ class LocalizationPipeline:
         """Update a fixed delay estimate and recompute only the open interval."""
         delay = float(delay)
         old_delay = self.calibration.delay_for(sensor)
+        report = self.preview_delay_change(sensor, delay)
         if abs(delay - old_delay) <= 1e-12:
-            interval = self.calibration.affected_interval(sensor, self.received)
+            return report
+        self.calibration = self.calibration.with_delay(sensor, delay)
+        for impact in report.rejected_observations:
+            key = (impact.sensor, impact.sequence, impact.arrival_time)
+            if impact.new_corrected_time <= (self.seal_time or float("inf")) + 1e-9:
+                self.late_rejected_observations[key] = impact
+            if (
+                self.seal_time is not None
+                and impact.old_corrected_time <= self.seal_time + 1e-9
+                and impact.new_corrected_time > self.seal_time + 1e-9
+            ):
+                self.held_observation_keys.add(key)
+        for impact in report.accepted_observations:
+            key = (impact.sensor, impact.sequence, impact.arrival_time)
+            self.held_observation_keys.discard(key)
+            self.late_rejected_observations.pop(key, None)
+        self.pending_corrections.append((sensor, old_delay, delay))
+        self._rebuild_tail()
+        return report
+
+    def preview_delay_change(
+        self, sensor: str, delay: float, baseline_delay: float | None = None
+    ) -> RecomputeReport:
+        """Compare a candidate delay with the current setting without mutating state."""
+        delay = float(delay)
+        old_delay = (
+            self.calibration.delay_for(sensor)
+            if baseline_delay is None
+            else float(baseline_delay)
+        )
+        visible = self._visible(self.arrival_horizon)
+        affected = [item for item in visible if item.sensor == sensor]
+        if not affected:
             return RecomputeReport(
-                sensor,
-                old_delay,
-                delay,
-                interval[0] if interval else 0.0,
-                interval[1] if interval else 0.0,
+                sensor, old_delay, delay, 0.0, 0.0,
                 self.seal_time if self.seal_time is not None else 0.0,
                 tuple(),
             )
-        interval = self.calibration.affected_interval(sensor, self.received)
-        if interval is None:
-            self.calibration = self.calibration.with_delay(sensor, delay)
-            return RecomputeReport(sensor, old_delay, delay, 0.0, 0.0, 0.0, tuple())
-        affected_from, affected_to = interval
-        blocked = [
+        old_times = [item.time - old_delay for item in affected]
+        new_times = [item.time - delay for item in affected]
+        impacts: list[ObservationImpact] = []
+        accepted: list[ObservationImpact] = []
+        rejected: list[ObservationImpact] = []
+        seal = self.seal_time
+        for observation, old_time, new_time in zip(affected, old_times, new_times, strict=True):
+            action, reason = self._classify_delay_impact(observation, old_time, new_time)
+            impact = ObservationImpact(
+                observation.sensor,
+                observation.sequence,
+                observation.time,
+                observation.arrival_time,
+                old_time,
+                new_time,
+                action,
+                reason,
+            )
+            impacts.append(impact)
+            (accepted if action == "recompute" else rejected).append(impact)
+        immutable = tuple(output.time for output in self.sealed_outputs)
+        blocked = tuple(
             output.time
             for output in self.sealed_outputs
-            if affected_from - 1e-9 <= output.time <= affected_to + 1e-9
-        ]
-        if blocked:
-            raise SealedHistoryError(sensor, interval, blocked)
-        self.calibration = self.calibration.with_delay(sensor, delay)
-        self._rebuild_tail()
+            if min(new_times) - 1e-9 <= output.time <= max(new_times) + 1e-9
+        )
+        open_new_times = [item.new_corrected_time for item in accepted]
         return RecomputeReport(
             sensor,
             old_delay,
             delay,
-            affected_from,
-            affected_to,
-            self.seal_time if self.seal_time is not None else 0.0,
-            tuple(blocked),
+            min(old_times),
+            max(old_times),
+            seal if seal is not None else 0.0,
+            blocked,
+            recomputed_to=max(open_new_times) if open_new_times else None,
+            immutable_history=immutable,
+            affected_observations=tuple(impacts),
+            rejected_observations=tuple(rejected),
+            accepted_observations=tuple(accepted),
         )
+
+    def compare_delay_settings(
+        self, sensor: str, left_delay: float, right_delay: float
+    ) -> tuple[RecomputeReport, RecomputeReport]:
+        """Return side-by-side plans for two delay choices against current data."""
+        return (
+            self.preview_delay_change(sensor, left_delay),
+            self.preview_delay_change(sensor, right_delay),
+        )
+
+    def undo_last_correction(self) -> RecomputeReport | None:
+        """Undo the newest correction that has not been sealed or published."""
+        if not self.pending_corrections:
+            return None
+        sensor, previous_delay, current_delay = self.pending_corrections.pop()
+        reverse_report = self.preview_delay_change(
+            sensor, previous_delay, baseline_delay=current_delay
+        )
+        self.calibration = self.calibration.with_delay(sensor, previous_delay)
+        for impact in reverse_report.rejected_observations:
+            key = (impact.sensor, impact.sequence, impact.arrival_time)
+            if impact.new_corrected_time <= (self.seal_time or float("inf")) + 1e-9:
+                self.late_rejected_observations[key] = impact
+            if (
+                self.seal_time is not None
+                and impact.old_corrected_time <= self.seal_time + 1e-9
+                and impact.new_corrected_time > self.seal_time + 1e-9
+            ):
+                self.held_observation_keys.add(key)
+        for impact in reverse_report.accepted_observations:
+            key = (impact.sensor, impact.sequence, impact.arrival_time)
+            self.held_observation_keys.discard(key)
+            self.late_rejected_observations.pop(key, None)
+        self._rebuild_tail()
+        return reverse_report
+
+    def _classify_delay_impact(
+        self, observation: Observation, old_time: float, new_time: float
+    ) -> tuple[str, str]:
+        seal = self.seal_time
+        if seal is None:
+            return "recompute", "no sealed history; corrected observation is in the open interval"
+        known_at_seal = (
+            self.sealed_at_arrival is not None
+            and observation.observed_at() <= self.sealed_at_arrival + 1e-9
+        )
+        if new_time <= seal + 1e-9:
+            if known_at_seal:
+                return (
+                    "reject",
+                    "new corrected time is in sealed history; "
+                    "the existing boundary state remains authoritative",
+                )
+            return (
+                "reject",
+                "late observation corrects to a sealed time and cannot be "
+                "inserted without rewriting history",
+            )
+        if old_time <= seal + 1e-9 and known_at_seal:
+            return (
+                "reject",
+                "observation cannot migrate out of the sealed anchor; reusing "
+                "it in the tail would double-count it",
+            )
+        if not known_at_seal:
+            return (
+                "recompute",
+                "late observation was absent when sealing occurred and its "
+                "corrected time lies in the open interval",
+            )
+        if old_time <= seal + 1e-9:
+            return (
+                "recompute",
+                "both corrected times remain after the sealed boundary anchor",
+            )
+        return "recompute", "both corrected times remain after the sealed boundary anchor"
 
     # ------------------------------------------------------------- inspection
 
@@ -201,6 +365,11 @@ class LocalizationPipeline:
             self.seal_time,
             self.calibration,
             self._visible(self.arrival_horizon),
+            self.sealed_at_arrival,
+            list(self.pending_corrections),
+            list(self.late_rejected_observations.values()),
+            list(self.held_observation_keys),
+            list(self.sealed_outputs),
         )
         self.checkpoints.append(checkpoint)
         return checkpoint
@@ -218,6 +387,13 @@ class LocalizationPipeline:
         self.calibration = checkpoint.calibration or DelayCalibration()
         self.arrival_horizon = checkpoint.arrival_horizon
         self.seal_time = checkpoint.seal_time
+        self.sealed_at_arrival = checkpoint.sealed_at_arrival
+        self.pending_corrections = list(checkpoint.pending_corrections)
+        self.held_observation_keys = set(checkpoint.held_observation_keys)
+        self.late_rejected_observations = {
+            (item.sensor, item.sequence, item.arrival_time): item
+            for item in checkpoint.rejected_observations
+        }
         visible = (
             prior_observations
             if prior_observations is not None
@@ -226,15 +402,14 @@ class LocalizationPipeline:
         self.received = list(visible)
         events = self._eligible(self.arrival_horizon) if self.arrival_horizon is not None else []
         if self.seal_time is not None:
-            self.sealed_outputs = self._replay_outputs(events[: checkpoint.event_count])
-            base = self.sealed_outputs[-1] if self.sealed_outputs else None
-            tail_events = events[checkpoint.event_count :]
-            if base is not None:
-                self.outputs = self._replay_outputs(
-                    tail_events, self._estimator_restored(base)
-                )
-            else:
-                self.outputs = self._replay_outputs(tail_events)
+            self.sealed_outputs = list(checkpoint.sealed_outputs)
+            base = self.sealed_outputs[-1] if self.sealed_outputs else checkpoint.state
+            tail_events = [
+                event for event in events if self._is_open_event(event, base)
+            ]
+            self.outputs = self._replay_outputs(
+                tail_events, self._estimator_restored(base)
+            )
         else:
             self.sealed_outputs = []
             self.estimator = self._estimator_restored(checkpoint.state)
@@ -297,6 +472,18 @@ class LocalizationPipeline:
     def _eligible(self, arrival_horizon: float | None) -> list[Observation]:
         return sorted(self._visible(arrival_horizon), key=lambda item: self._sort_key(item))
 
+    def _observation_key(self, observation: Observation) -> tuple[str, int, float | None]:
+        return (observation.sensor, observation.sequence, observation.arrival_time)
+
+    def _is_open_event(
+        self, observation: Observation, anchor: StateEstimate | None = None
+    ) -> bool:
+        corrected_time = self.calibration.corrected_time(observation)
+        if anchor is not None and corrected_time <= anchor.time + 1e-9:
+            return False
+        key = self._observation_key(observation)
+        return key not in self.held_observation_keys and key not in self.late_rejected_observations
+
     def _trim_checkpoints(self) -> None:
         if self.sealed_outputs:
             base_time = self.sealed_outputs[-1].time
@@ -314,13 +501,15 @@ class LocalizationPipeline:
             return
         if events is None:
             events = self._eligible(self.arrival_horizon)
-        sealed_count = len(self.sealed_outputs)
         if self.sealed_outputs:
             self.estimator.restore(self.sealed_outputs[-1])
-            tail = events[sealed_count:]
+            tail = [
+                event for event in events
+                if self._is_open_event(event, self.sealed_outputs[-1])
+            ]
         else:
             self.estimator = LocalizationEstimator()
-            tail = events
+            tail = [event for event in events if self._is_open_event(event)]
         rebuilt: list[StateEstimate] = []
         for observation in tail:
             self.estimator.step(self._retime(observation))
@@ -335,6 +524,11 @@ class LocalizationPipeline:
                 self.seal_time,
                 self.calibration,
                 self._visible(self.arrival_horizon),
+                self.sealed_at_arrival,
+                list(self.pending_corrections),
+                list(self.late_rejected_observations.values()),
+                list(self.held_observation_keys),
+                list(self.sealed_outputs),
             )
         )
 

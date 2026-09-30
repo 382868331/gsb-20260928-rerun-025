@@ -243,8 +243,6 @@ class DelayCalibrationTests(unittest.TestCase):
         self.assertLess(corrected, 0.5 * uncorrected)
 
     def test_changing_delay_recomputes_only_open_interval(self) -> None:
-        from robot_localization.pipeline import SealedHistoryError
-
         source = delayed_source()
         pipeline = LocalizationPipeline(
             calibration=DelayCalibration({"rear_wheels": 0.10, "imu": 0.12})
@@ -264,15 +262,128 @@ class DelayCalibrationTests(unittest.TestCase):
         self.assertEqual(report.recomputed_from, 0.0)
         self.assertFalse(report.sealed_blocked)
         sealed_values = [state.x for state in pipeline.sealed_outputs]
-        with self.assertRaises(SealedHistoryError):
-            pipeline.set_sensor_delay("rear_wheels", 0.45)
-        # Sealed outputs remain byte-for-byte stable; only the open tail
-        # could be recomputed.
+        partial = pipeline.set_sensor_delay("rear_wheels", 0.45)
+        self.assertTrue(partial.accepted_observations)
+        self.assertTrue(partial.rejected_observations)
+        self.assertGreater(partial.recomputed_from, 5.0 - 1e-9)
+        self.assertAlmostEqual(partial.recomputed_to, 9.85)
+        rejected_late = next(
+            item for item in partial.rejected_observations
+            if item.arrival_time > pipeline.sealed_at_arrival + 1e-9
+        )
+        self.assertLessEqual(rejected_late.new_corrected_time, pipeline.seal_time + 1e-9)
+        self.assertIn("sealed", rejected_late.reason)
         self.assertEqual([state.x for state in pipeline.sealed_outputs], sealed_values)
 
-    def test_delay_change_touching_sealed_output_is_rejected(self) -> None:
-        from robot_localization.pipeline import SealedHistoryError
+    def test_delay_comparison_explains_cross_boundary_decisions(self) -> None:
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"wheels": 0.30, "imu": 0.0})
+        )
+        pipeline.add_observation(ImuObservation(0.2, "imu", 1, 0.0, 0.0, arrival_time=0.2))
+        pipeline.add_observation(
+            WheelObservation(1.3, "wheels", 1, 1.0, 0.0, arrival_time=1.3)
+        )
+        pipeline.process_until(1.3)
+        pipeline.seal_until(1.0)
+        pipeline.add_observation(
+            WheelObservation(1.4, "wheels", 2, 1.0, 0.0, arrival_time=1.4)
+        )
+        pipeline.process_until(1.4)
 
+        smaller, larger = pipeline.compare_delay_settings("wheels", 0.10, 0.50)
+        self.assertEqual(
+            [item.action for item in smaller.affected_observations],
+            ["reject", "recompute"],
+        )
+        self.assertIn("double-count", smaller.rejected_observations[0].reason)
+        self.assertIn("absent when sealing", smaller.accepted_observations[0].reason)
+        self.assertTrue(all(item.action == "reject" for item in larger.affected_observations))
+        self.assertIn("sealed history", larger.rejected_observations[0].reason)
+        self.assertIn("late observation", larger.rejected_observations[1].reason)
+
+    def test_second_seal_freezes_recomputed_open_tail(self) -> None:
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"wheels": 0.30, "imu": 0.0})
+        )
+        for time, arrival in [(0.5, 0.5), (1.3, 1.3), (2.3, 2.3), (3.3, 3.3)]:
+            pipeline.add_observation(ImuObservation(time, "imu", int(time * 10), 0.0, 0.0, arrival_time=arrival))
+            pipeline.add_observation(
+                WheelObservation(time, "wheels", int(time * 10), 1.0, 0.0, arrival_time=arrival)
+            )
+            pipeline.process_until(arrival)
+            if pipeline.seal_time is None and arrival >= 1.3:
+                pipeline.seal_until(1.0)
+        pipeline.set_sensor_delay("wheels", 0.10)
+        second_seal_values = [
+            state.x
+            for state in pipeline.outputs
+            if state.time > 1.0 + 1e-9 and state.time <= 3.2 + 1e-9
+        ]
+        pipeline.seal_until(3.2)
+        self.assertFalse(pipeline.pending_corrections)
+        pipeline.set_sensor_delay("wheels", 0.50)
+        self.assertEqual(
+            [
+                state.x
+                for state in pipeline.sealed_outputs
+                if state.time > 1.0 + 1e-9 and state.time <= 3.2 + 1e-9
+            ],
+            second_seal_values,
+        )
+
+    def test_undo_unpublished_correction_restores_open_tail_times(self) -> None:
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"wheels": 0.30, "imu": 0.0})
+        )
+        for sequence, time in enumerate([1.3, 2.3, 3.3], start=1):
+            pipeline.add_observation(ImuObservation(time, "imu", sequence, 0.0, 0.0, arrival_time=time))
+            pipeline.add_observation(
+                WheelObservation(time, "wheels", sequence, 1.0, 0.0, arrival_time=time)
+            )
+            pipeline.process_until(time)
+        before = [(state.time, state.x) for state in pipeline.all_outputs()]
+        pipeline.set_sensor_delay("wheels", 0.10)
+        changed = [(state.time, state.x) for state in pipeline.all_outputs()]
+        self.assertNotEqual(before, changed)
+        undo_report = pipeline.undo_last_correction()
+        self.assertIsNotNone(undo_report)
+        self.assertEqual([(state.time, state.x) for state in pipeline.all_outputs()], before)
+
+    def test_saved_pipeline_resumes_with_seal_and_pending_correction(self) -> None:
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"wheels": 0.30, "imu": 0.0})
+        )
+        messages = [
+            (ImuObservation(0.2, "imu", 1, 0.0, 0.0, arrival_time=0.2), 0.2),
+            (WheelObservation(1.3, "wheels", 1, 1.0, 0.0, arrival_time=1.3), 1.3),
+            (WheelObservation(2.3, "wheels", 2, 1.0, 0.0, arrival_time=2.3), 2.3),
+            (WheelObservation(3.3, "wheels", 3, 1.0, 0.0, arrival_time=3.3), 3.3),
+        ]
+        pipeline.add_observation(messages[0][0]); pipeline.process_until(messages[0][1])
+        pipeline.add_observation(messages[1][0]); pipeline.process_until(messages[1][1])
+        pipeline.seal_until(1.0)
+        pipeline.add_observation(messages[2][0]); pipeline.process_until(messages[2][1])
+        pipeline.set_sensor_delay("wheels", 0.10)
+        checkpoint = pipeline.save_checkpoint()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pipeline-checkpoint.json"
+            CheckpointStore(path).save_pipeline_checkpoint(checkpoint)
+            loaded = CheckpointStore(path).load_pipeline_checkpoint()
+        resumed = LocalizationPipeline()
+        resumed.restore_checkpoint(loaded)
+        self.assertEqual(resumed.seal_time, pipeline.seal_time)
+        self.assertEqual(resumed.calibration.as_dict(), pipeline.calibration.as_dict())
+        self.assertEqual(resumed.pending_corrections, pipeline.pending_corrections)
+        resumed.add_observation(messages[3][0])
+        resumed.process_until(messages[3][1])
+        pipeline.add_observation(messages[3][0])
+        pipeline.process_until(messages[3][1])
+        self.assertEqual(
+            [(s.time, s.x) for s in resumed.all_outputs()],
+            [(s.time, s.x) for s in pipeline.all_outputs()],
+        )
+
+    def test_delay_change_touching_sealed_output_keeps_history_and_open_tail(self) -> None:
         source = delayed_source()
         pipeline = LocalizationPipeline(
             calibration=DelayCalibration({"rear_wheels": 0.10, "imu": 0.12})
@@ -284,10 +395,13 @@ class DelayCalibrationTests(unittest.TestCase):
             if pipeline.seal_time is None and message.observed_at() >= 5.3:
                 pipeline.seal_until(5.0)
                 sealed_value = pipeline.sealed_outputs[-1].x
-        with self.assertRaises(SealedHistoryError) as context:
-            pipeline.set_sensor_delay("rear_wheels", 0.45)
-        self.assertTrue(context.exception.sealed_times)
-        # Sealed outputs are untouched after the rejected update.
+        before_open = [(s.time, s.x) for s in pipeline.outputs]
+        report = pipeline.set_sensor_delay("rear_wheels", 0.45)
+        after_open = [(s.time, s.x) for s in pipeline.outputs]
+        self.assertTrue(report.sealed_blocked)
+        self.assertTrue(report.rejected_observations)
+        self.assertTrue(report.accepted_observations)
+        self.assertNotEqual(before_open, after_open)
         self.assertEqual(pipeline.sealed_outputs[-1].x, sealed_value)
 
     def test_backfill_burst_never_moves_live_state_backwards(self) -> None:

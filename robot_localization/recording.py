@@ -46,6 +46,8 @@ class CheckpointStore:
         seal_time: float | None = None,
         sealed_outputs: list[StateEstimate] | None = None,
         rejected_observations: dict[tuple[str, int], str] | None = None,
+        clock_models: dict[str, object] | None = None,
+        staged_plan: tuple[str, float, float, float] | None = None,
     ) -> None:
         payload = {
             "time": estimate.time,
@@ -68,6 +70,25 @@ class CheckpointStore:
             "arrival_horizon": arrival_horizon,
             "seal_time": seal_time,
             "fixed_delays": calibration or {},
+            "clock_models": [
+                {
+                    "sensor": sensor,
+                    "delay": float(model.delay),
+                    "drift": float(model.drift),
+                    "epoch": float(model.epoch),
+                }
+                for sensor, model in (clock_models or {}).items()
+            ],
+            "staged_clock_plan": (
+                None
+                if staged_plan is None
+                else {
+                    "sensor": staged_plan[0],
+                    "delay": staged_plan[1],
+                    "drift": staged_plan[2],
+                    "epoch": staged_plan[3],
+                }
+            ),
             "sealed_outputs": [
                 serialize_state(item)
                 for item in (sealed_outputs or [])
@@ -108,6 +129,11 @@ class CheckpointStore:
             "arrival_horizon": payload.get("arrival_horizon"),
             "seal_time": payload.get("seal_time"),
             "fixed_delays": payload.get("fixed_delays", {}),
+            "clock_models": [
+                dict(item)
+                for item in payload.get("clock_models", [])
+            ],
+            "staged_clock_plan": payload.get("staged_clock_plan"),
             "sealed_outputs": [
                 deserialize_state(item) for item in payload.get("sealed_outputs", [])
             ],

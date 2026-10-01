@@ -19,6 +19,20 @@ from robot_localization.types import ImuObservation, WheelObservation
 
 
 TRUE_DELAYS = {"rear_wheels": 0.30, "imu": 0.12}
+TRUE_DRIFTS = {"rear_wheels": 0.02}
+
+
+def drifting_source() -> SyntheticScenarioSource:
+    return SyntheticScenarioSource(
+        fixed_delays=TRUE_DELAYS,
+        clock_drifts=TRUE_DRIFTS,
+    )
+
+
+def ingest(pipeline: LocalizationPipeline, messages) -> None:
+    for message in messages:
+        pipeline.add_observation(message)
+        pipeline.process_until(message.observed_at())
 
 
 def delayed_source() -> SyntheticScenarioSource:
@@ -463,6 +477,202 @@ class DelayCalibrationTests(unittest.TestCase):
         self.assertEqual(boundary_at_checkpoint, after)
         # Messages that arrived after the checkpoint stay hidden.
         self.assertEqual(len(restored.received), len(prior))
+
+
+class ClockDriftCalibrationTests(unittest.TestCase):
+    def test_drifting_clock_is_linear_model(self) -> None:
+        calibration = DelayCalibration(
+            {"rear_wheels": (0.30, 0.02, 0.0)}
+        )
+        # corrected = epoch + (stamp - epoch)/(1 + drift) - delay
+        self.assertAlmostEqual(
+            calibration.corrected_time(
+                WheelObservation(5.406, "rear_wheels", 0, 1.0, 0.0)
+            ),
+            5.0,
+            places=6,
+        )
+        # Zero drift reproduces the fixed-delay behaviour exactly.
+        fixed = DelayCalibration({"rear_wheels": 0.30})
+        observation = WheelObservation(5.3, "rear_wheels", 1, 6.0, 0.0)
+        self.assertAlmostEqual(
+            fixed.corrected_time(observation),
+            DelayCalibration({"rear_wheels": (0.30, 0.0, 0.0)}).corrected_time(observation),
+        )
+
+    def test_drift_correction_recovers_physical_times(self) -> None:
+        source = drifting_source()
+        wrong = DelayCalibration(TRUE_DELAYS)
+        right = DelayCalibration({"rear_wheels": (0.30, 0.02, 0.0), "imu": 0.12})
+        residuals_wrong = []
+        residuals_right = []
+        for message in source.observations():
+            if message.sensor != "rear_wheels" or message.arrival_time is None:
+                continue
+            if message.arrival_time > 7.9:
+                continue
+            physical = (message.arrival_time - 0.30) / 1.02
+            residuals_wrong.append(abs(wrong.corrected_time(message) - physical))
+            residuals_right.append(abs(right.corrected_time(message) - physical))
+        self.assertGreater(sum(residuals_wrong) / len(residuals_wrong), 0.05)
+        self.assertLess(sum(residuals_right) / len(residuals_right), 0.02)
+
+    def test_drift_comparison_keeps_sealed_history_and_explains_crossings(self) -> None:
+        pipeline = LocalizationPipeline(calibration=DelayCalibration(TRUE_DELAYS))
+        ingest(pipeline, drifting_source().observations())
+        pipeline.seal_until(5.0)
+        sealed_before = [
+            (state.time, state.x, state.y) for state in pipeline.sealed_outputs
+        ]
+        comparison = pipeline.stage_clock_revision("rear_wheels", 0.30, 0.02, 0.0)
+        self.assertEqual(comparison.sealed_history, (0.0, 5.0))
+        self.assertEqual(comparison.boundary_state_time, 5.0)
+        self.assertEqual(comparison.baseline.drift, 0.0)
+        self.assertEqual(comparison.candidate.drift, 0.02)
+        classes = {item.classification for item in comparison.decisions}
+        self.assertIn("sealed_unchanged", classes)
+        self.assertIn("crossing_rejected", classes)
+        report = pipeline.publish_staged_clock_revision()
+        self.assertTrue(report.rejected_observations)
+        self.assertEqual(
+            [(state.time, state.x, state.y) for state in pipeline.sealed_outputs],
+            sealed_before,
+        )
+        # Raw stamps are immutable: the published clock revision never rewrote
+        # any received observation's original timestamp.
+        raw_source = drifting_source().observations()
+        for original, stored in zip(raw_source, pipeline.received):
+            self.assertEqual(original.time, stored.time)
+            self.assertEqual(original.sequence, stored.sequence)
+
+    def test_simultaneous_and_swapped_observations_keep_identity(self) -> None:
+        # Two sensors whose corrected times cross and become simultaneous:
+        # neither identity may be duplicated or dropped after retiming.
+        pipeline = LocalizationPipeline()
+        messages = [
+            WheelObservation(1.00, "rear_wheels", 1, 1.0, 0.0, arrival_time=1.0),
+            WheelObservation(1.50, "rear_wheels", 2, 1.0, 0.0, arrival_time=1.5),
+            ImuObservation(2.00, "imu", 1, 0.0, 0.0, arrival_time=2.0),
+            ImuObservation(2.00, "imu", 2, 0.0, 0.0, arrival_time=2.0),
+        ]
+        ingest(pipeline, messages)
+        comparison = pipeline.stage_clock_revision("imu", 0.0, 0.5, 0.0)
+        identities = set(comparison.applied_identities)
+        # All four distinct (sensor, sequence) pairs survive the retiming.
+        self.assertEqual(
+            identities,
+            {
+                ("rear_wheels", 1),
+                ("rear_wheels", 2),
+                ("imu", 1),
+                ("imu", 2),
+            },
+        )
+        self.assertEqual(len(comparison.applied_identities), len(identities))
+        # imu/1 originally followed wheels/2 and precedes it after retiming;
+        # the two IMU samples become simultaneous with distinct identities.
+        swaps = {
+            (change.sensor, change.sequence): change.ordering_swapped_with
+            for change in comparison.position_changes
+            if change.sensor == "imu"
+        }
+        self.assertIn(("rear_wheels", 2), swaps[("imu", 1)])
+        self.assertIn((("imu", 1), ("imu", 2)), comparison.simultaneous_groups)
+        report = pipeline.publish_staged_clock_revision()
+        applied = list(report.applied_identities)
+        self.assertEqual(len(applied), len(set(applied)))
+
+    def test_uncertain_intervals_are_distinct_from_retiming_changes(self) -> None:
+        pipeline = LocalizationPipeline(calibration=DelayCalibration(TRUE_DELAYS))
+        ingest(pipeline, drifting_source().observations())
+        pipeline.seal_until(5.0)
+        comparison = pipeline.stage_clock_revision("rear_wheels", 0.30, 0.02, 0.0)
+        # The wheel outage/backfill window is reported as missing-observation
+        # uncertainty rather than attributed to the clock revision.
+        outage = [
+            interval
+            for interval in comparison.uncertain_intervals
+            if interval.from_time >= 6.0 and interval.to_time <= 8.0
+        ]
+        self.assertTrue(outage)
+        self.assertTrue(
+            all("缺少观测" in interval.reason for interval in outage)
+        )
+        # Position changes carry an explicit retiming attribution cause.
+        self.assertTrue(comparison.position_changes)
+        self.assertTrue(
+            all(change.cause for change in comparison.position_changes)
+        )
+
+    def test_unpublished_draft_is_resumed_from_checkpoint(self) -> None:
+        pipeline = LocalizationPipeline(calibration=DelayCalibration(TRUE_DELAYS))
+        ingest(pipeline, drifting_source().observations())
+        pipeline.seal_until(5.0)
+        pipeline.stage_clock_revision("rear_wheels", 0.30, 0.02, 0.0)
+        checkpoint = pipeline.save_checkpoint()
+        resumed = LocalizationPipeline()
+        resumed.restore_checkpoint(checkpoint)
+        # Saving and reopening continues the same unpublished plan.
+        self.assertEqual(
+            resumed.pending_clock_revision(),
+            ("rear_wheels", 0.30, 0.02, 0.0),
+        )
+        sealed_before = [
+            (state.time, state.x, state.y) for state in resumed.sealed_outputs
+        ]
+        # Withdrawing the draft leaves trajectory and raw stamps untouched.
+        resumed.discard_staged_delay()
+        self.assertIsNone(resumed.pending_clock_revision())
+        self.assertEqual(resumed.calibration.drift_for("rear_wheels"), 0.0)
+        self.assertEqual(
+            [(state.time, state.x, state.y) for state in resumed.sealed_outputs],
+            sealed_before,
+        )
+
+    def test_reseal_with_pending_draft_does_not_publish_it(self) -> None:
+        pipeline = LocalizationPipeline(calibration=DelayCalibration(TRUE_DELAYS))
+        ingest(pipeline, drifting_source().observations())
+        pipeline.seal_until(5.0)
+        pipeline.stage_clock_revision("rear_wheels", 0.30, 0.02, 0.0)
+        pipeline.seal_until(6.0)
+        # Still unpublished after re-sealing; published calibration unchanged.
+        self.assertEqual(
+            pipeline.pending_clock_revision(),
+            ("rear_wheels", 0.30, 0.02, 0.0),
+        )
+        self.assertEqual(pipeline.calibration.drift_for("rear_wheels"), 0.0)
+        comparison = pipeline.staged_clock_comparison
+        self.assertEqual(comparison.boundary_state_time, 6.0)
+        checkpoint = pipeline.save_checkpoint()
+        self.assertEqual(checkpoint.staged_plan, ("rear_wheels", 0.30, 0.02, 0.0))
+
+    def test_file_checkpoint_persists_drift_and_pending_draft(self) -> None:
+        pipeline = LocalizationPipeline(calibration=DelayCalibration(TRUE_DELAYS))
+        ingest(pipeline, drifting_source().observations())
+        pipeline.seal_until(5.0)
+        pipeline.stage_clock_revision("rear_wheels", 0.30, 0.02, 0.0)
+        checkpoint = pipeline.save_checkpoint()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            CheckpointStore(path).save(
+                checkpoint.state,
+                checkpoint.visible_observations,
+                calibration=checkpoint.calibration.as_dict(),
+                arrival_horizon=checkpoint.arrival_horizon,
+                seal_time=checkpoint.seal_time,
+                sealed_outputs=checkpoint.sealed_outputs,
+                rejected_observations=checkpoint.rejected_observations,
+                clock_models=checkpoint.calibration.clock_models(),
+                staged_plan=checkpoint.staged_plan,
+            )
+            state, observations, metadata = CheckpointStore(path).load_with_metadata()
+        plan = metadata["staged_clock_plan"]
+        self.assertEqual(plan["sensor"], "rear_wheels")
+        self.assertAlmostEqual(plan["drift"], 0.02)
+        model = next(
+            item for item in metadata["clock_models"] if item["sensor"] == "rear_wheels"
+        )
+        self.assertAlmostEqual(model["delay"], 0.30)
 
 
 if __name__ == "__main__":

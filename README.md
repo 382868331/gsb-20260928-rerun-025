@@ -31,7 +31,20 @@ python -m robot_localization.cli --output-dir outputs
 
 轮速断流、IMU 断流和疑似打滑都会写入 `degraded_reasons`。断流期间协方差继续增长，因此误差范围会扩大，不会声称精度保持不变。
 
+## 逐渐漂移的时钟校时
+
+固定延迟只能表示恒定偏移，但某台传感器的时钟可能逐渐走快或走慢。`calibration.py` 的每路时钟模型因此是线性的：`corrected = epoch + (stamp - epoch)/(1 + drift) - delay`，其中 `drift=0` 时严格退化为原有的固定延迟校正；`stamp` 与 `arrival_time` 始终原样保留，任何校时都不会改写观测的原始时间戳或观测身份 `(sensor, sequence)`。
+
+用户针对一段采集记录调用 `stage_clock_revision(sensor, delay, drift, epoch)` 生成 `ClockComparison`，与原时间解释并排展示：两套设置各自的 `delay/drift/epoch`、校正区间、受影响/开放/封存/被拒观测序号，以及封存边界 `boundary_state_time`。确认后用 `publish_staged_clock_revision()` 从封存锚点只重放开放区间，用 `discard_staged_delay()` 撤回未发布方案。
+
+- **跨边界观测逐条说明**：旧、新校正时间都在边界后的参与开放重算（`open_recomputed`）；都在边界前的保持封存原值（`sealed_unchanged`）；候选模型会把开放观测移入封存区间的拒绝并记录原因（`crossing_rejected`），绝不回写封存轨迹；把封存观测移到边界后的则从同一封存锚点纳入开放重算（`open_adopted`）。
+- **同刻与换序不丢身份**：开放事件按校正时间排序，同刻按传感器名与序号确定性打破平局。`simultaneous_groups` 列出变成同刻的身份组，`position_changes[].ordering_swapped_with` 列出交换先后的身份；`applied_identities` 去重保存所有真正应用的 `(sensor, sequence)`，不会因同刻或换序而重复应用或丢失任何一条观测。
+- **位置变化归因**：`position_changes` 给出每条受影响观测的原/新校正时间、时间位移、相对原解释在同一轨迹时刻的位置变化及原因；`uncertain_intervals` 单独标出没有任何观测的区间和该传感器断流区间，说明这些位置仍因缺少观测而不确定，不能归因于校时。
+- **未处理完的方案可重开续做**：未发布草稿随检查点保存（检查点新增 `staged_plan`，文件检查点新增 `staged_clock_plan` 与每路 `clock_models`）。重开后 `pending_clock_revision()` 返回同一方案并可直接发布；封存推进时草稿不丢失，只是按新边界刷新说明。再次封存或撤回未发布校时后，已封存轨迹与原始时间戳均不被改写。
+
 默认示例同时运行零延迟（未校正）基线与延迟校正运行，`metrics.json` 输出两者的位置 RMSE、95% 半径覆盖率、已发布重算记录、两套延迟设置的并排比较、未发布校正的撤销记录以及恢复前后的可见边界；`trajectory.csv` 增加 `raw_position_error` 与 `sealed` 列。
+
+默认示例的轮速时钟带 `0.02` 的线性漂移；`metrics.json` 额外输出漂移校时的并排比较（`clock_revision_comparison`）、未发布草稿保存重开后续做同一方案（`clock_draft_resumed_after_reopen`）以及发布后的位置变化、缺测不确定区间、同刻/换序身份与去重应用身份（`clock_revision_published`）。
 
 ## 测试
 

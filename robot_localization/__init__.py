@@ -3,12 +3,17 @@
 from .calibration import DelayCalibration, SensorDelayModel
 from .estimator import LocalizationEstimator, StateEstimate
 from .pipeline import (
+    ClockComparison,
+    ClockRevisionReport,
+    ClockSettingView,
     DelayComparison,
     DelaySettingView,
     LocalizationPipeline,
     ObservationDecision,
+    ObservationPositionChange,
     RecomputeReport,
     SealedHistoryError,
+    UncertainInterval,
 )
 from .recording import CheckpointStore, JsonlMessageSource, JsonlRecorder
 from .sources import SyntheticScenarioSource
@@ -20,6 +25,11 @@ __all__ = [
     "WheelObservation",
     "SensorDelayModel",
     "DelayCalibration",
+    "ClockComparison",
+    "ClockRevisionReport",
+    "ClockSettingView",
+    "ObservationPositionChange",
+    "UncertainInterval",
     "LocalizationEstimator",
     "StateEstimate",
     "LocalizationPipeline",

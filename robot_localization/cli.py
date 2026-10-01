@@ -44,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     discarded_revision: dict[str, object] | None = None
     saved_checkpoint = None
     boundary_at_checkpoint = None
+    resume_comparison = None
     for index, observation in enumerate(messages):
         pipeline.add_observation(observation)
         pipeline.process_until(observation.observed_at())
@@ -64,15 +65,23 @@ def main(argv: list[str] | None = None) -> int:
         ):
             pipeline.seal_until(SEAL_AT)
         # Persist while later messages are still hidden, then keep ingesting.
+        if index == len(messages) - 30 and pipeline.staged_calibration is None:
+            resume_comparison = pipeline.stage_sensor_clock(
+                "rear_wheels",
+                anchors=[(0.0, -TRUE_DELAYS["rear_wheels"]), (10.0, 9.55)],
+            )
         if index == len(messages) - 25:
             saved_checkpoint = pipeline.save_checkpoint()
             boundary_at_checkpoint = pipeline.visible_data_boundary()
 
-    comparison = pipeline.stage_sensor_delay("rear_wheels", 0.45)
+    comparison = pipeline.stage_sensor_clock(
+        "rear_wheels",
+        anchors=[(0.0, -TRUE_DELAYS["rear_wheels"]), (10.0, 9.55)],
+    )
     delay_comparison = _describe_comparison(comparison)
     discarded_revision = {
         "sensor": "rear_wheels",
-        "candidate_delay": 0.45,
+        "candidate_clock": pipeline.staged_calibration.clock_for("rear_wheels").as_dict(),
         "published": False,
         "message": "候选校正尚未发布即撤销，当前轨迹和已发布延迟保持不变",
     }
@@ -117,6 +126,12 @@ def main(argv: list[str] | None = None) -> int:
         seal_time=pipeline.seal_time,
         sealed_outputs=checkpoint.sealed_outputs,
         rejected_observations=checkpoint.rejected_observations,
+        staged_calibration=(
+            checkpoint.staged_calibration.as_dict()
+            if checkpoint.staged_calibration is not None
+            else None
+        ),
+        staged_sensor=checkpoint.staged_sensor,
     )
 
     # Restore must present exactly the same visible data boundary: a message
@@ -127,10 +142,16 @@ def main(argv: list[str] | None = None) -> int:
         event_count=len(metadata["sealed_outputs"]),
         arrival_horizon=metadata["arrival_horizon"],
         seal_time=metadata["seal_time"],
-        calibration=DelayCalibration(metadata["fixed_delays"]),
+        calibration=DelayCalibration(metadata["clock_models"]),
         visible_observations=loaded_observations,
         sealed_outputs=metadata["sealed_outputs"],
         rejected_observations=metadata["rejected_observations"],
+        staged_calibration=(
+            DelayCalibration(metadata["staged_calibration"])
+            if metadata["staged_calibration"]
+            else None
+        ),
+        staged_sensor=metadata["staged_sensor"],
     )
     restored = LocalizationPipeline()
     restored.restore_checkpoint(loaded_checkpoint)
@@ -148,6 +169,12 @@ def main(argv: list[str] | None = None) -> int:
     metrics["visible_boundary_before_restore"] = boundary_at_checkpoint
     metrics["visible_boundary_after_restore"] = boundary_after
     metrics["restore_preserves_boundary"] = boundary_at_checkpoint == boundary_after
+    metrics["resume_staged_calibration"] = (
+        _describe_comparison(resume_comparison)
+        if resume_comparison is not None
+        else None
+    )
+    metrics["restored_staged_sensor"] = restored.staged_sensor
     (args.output_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -179,7 +206,11 @@ def _metrics(rows, pipeline: LocalizationPipeline) -> dict:
         "position_95_coverage": within_95 / len(rows),
         "degraded_samples": sum(1 for row in rows if row["degraded_reasons"]),
         "sealed_output_count": len(pipeline.sealed_outputs),
-        "fixed_delays": pipeline.calibration.as_dict(),
+        "clock_models": pipeline.calibration.as_dict(),
+        "fixed_delays": {
+            sensor: model.delay
+            for sensor, model in pipeline.calibration.clock_items()
+        },
     }
 
 
@@ -212,12 +243,47 @@ def _describe_comparison(comparison: DelayComparison) -> dict[str, object]:
         "observations": [
             _describe_decision(item) for item in comparison.decisions
         ],
+        "timeline": [
+            {
+                "identity": list(item.identity),
+                "stamp": item.stamp,
+                "arrival_time": item.arrival_time,
+                "baseline_time": item.baseline_time,
+                "candidate_time": item.candidate_time,
+                "time_shift": item.time_shift,
+                "baseline_order": item.baseline_order,
+                "candidate_order": item.candidate_order,
+                "order_delta": item.order_delta,
+                "classification": item.classification,
+                "reason": item.reason,
+            }
+            for item in comparison.timeline
+        ],
+        "position_changes": [
+            {
+                "identity": list(item.identity),
+                "baseline_time": item.baseline_time,
+                "candidate_time": item.candidate_time,
+                "baseline_position": [item.baseline_x, item.baseline_y],
+                "candidate_position": [item.candidate_x, item.candidate_y],
+            }
+            for item in comparison.position_changes
+        ],
+        "uncertain_intervals": [
+            {
+                "start": item.start,
+                "end": item.end,
+                "reason": item.reason,
+            }
+            for item in comparison.uncertain_intervals
+        ],
     }
 
 
 def _describe_setting(setting) -> dict[str, object]:
     return {
         "delay": setting.delay,
+        "clock": setting.clock.as_dict() if setting.clock is not None else None,
         "corrected_interval": list(setting.corrected_interval or []),
         "affected_observations": list(setting.affected_sequences),
         "open_observations": list(setting.open_sequences),
@@ -232,7 +298,9 @@ def _describe_decision(decision) -> dict[str, object]:
         "sequence": decision.sequence,
         "stamp": decision.stamp,
         "arrival_time": decision.arrival_time,
+        "baseline_corrected_time": decision.baseline_corrected_time,
         "candidate_corrected_time": decision.corrected_time,
+        "time_shift": decision.time_shift,
         "classification": decision.classification,
         "reason": decision.reason,
     }

@@ -1,6 +1,6 @@
 """Offline causal robot localization core."""
 
-from .calibration import DelayCalibration, SensorDelayModel
+from .calibration import ClockAnchor, DelayCalibration, SensorClockModel, SensorDelayModel
 from .estimator import LocalizationEstimator, StateEstimate
 from .pipeline import (
     DelayComparison,
@@ -9,6 +9,9 @@ from .pipeline import (
     ObservationDecision,
     RecomputeReport,
     SealedHistoryError,
+    TimelinePosition,
+    TimelinePositionChange,
+    UncertainInterval,
 )
 from .recording import CheckpointStore, JsonlMessageSource, JsonlRecorder
 from .sources import SyntheticScenarioSource
@@ -19,6 +22,8 @@ __all__ = [
     "Observation",
     "WheelObservation",
     "SensorDelayModel",
+    "SensorClockModel",
+    "ClockAnchor",
     "DelayCalibration",
     "LocalizationEstimator",
     "StateEstimate",
@@ -32,4 +37,7 @@ __all__ = [
     "DelayComparison",
     "DelaySettingView",
     "ObservationDecision",
+    "TimelinePosition",
+    "TimelinePositionChange",
+    "UncertainInterval",
 ]

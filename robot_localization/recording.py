@@ -41,11 +41,13 @@ class CheckpointStore:
         self,
         estimate: StateEstimate,
         observations: Iterable[Observation] | None = None,
-        calibration: dict[str, float] | None = None,
+        calibration: dict[str, object] | None = None,
         arrival_horizon: float | None = None,
         seal_time: float | None = None,
         sealed_outputs: list[StateEstimate] | None = None,
         rejected_observations: dict[tuple[str, int], str] | None = None,
+        staged_calibration: dict[str, object] | None = None,
+        staged_sensor: str | None = None,
     ) -> None:
         payload = {
             "time": estimate.time,
@@ -67,7 +69,10 @@ class CheckpointStore:
             ],
             "arrival_horizon": arrival_horizon,
             "seal_time": seal_time,
-            "fixed_delays": calibration or {},
+            "clock_models": calibration or {},
+            "fixed_delays": _legacy_fixed_delays(calibration or {}),
+            "staged_calibration": staged_calibration,
+            "staged_sensor": staged_sensor,
             "sealed_outputs": [
                 serialize_state(item)
                 for item in (sealed_outputs or [])
@@ -107,6 +112,9 @@ class CheckpointStore:
         metadata = {
             "arrival_horizon": payload.get("arrival_horizon"),
             "seal_time": payload.get("seal_time"),
+            "clock_models": payload.get(
+                "clock_models", payload.get("fixed_delays", {})
+            ),
             "fixed_delays": payload.get("fixed_delays", {}),
             "sealed_outputs": [
                 deserialize_state(item) for item in payload.get("sealed_outputs", [])
@@ -115,12 +123,24 @@ class CheckpointStore:
                 (item["sensor"], item["sequence"]): item["reason"]
                 for item in payload.get("rejected_observations", [])
             },
+            "staged_calibration": payload.get("staged_calibration"),
+            "staged_sensor": payload.get("staged_sensor"),
         }
         return estimate, observations, metadata
 
     def load(self) -> tuple[StateEstimate, list[Observation]]:
         estimate, observations, _ = self.load_with_metadata()
         return estimate, observations
+
+
+def _legacy_fixed_delays(calibration: dict[str, object]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for sensor, model in calibration.items():
+        if isinstance(model, (int, float)):
+            result[sensor] = float(model)
+        elif isinstance(model, dict) and model.get("type", "fixed") == "fixed":
+            result[sensor] = float(model.get("delay", 0.0))
+    return result
 
 
 def serialize_state(estimate: StateEstimate) -> dict[str, object]:

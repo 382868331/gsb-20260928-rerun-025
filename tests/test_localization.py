@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from robot_localization.estimator import LocalizationEstimator
-from robot_localization.calibration import DelayCalibration
+from robot_localization.calibration import DelayCalibration, SensorClockModel
 from robot_localization.pipeline import LocalizationPipeline
 from robot_localization.recording import (
     CheckpointStore,
@@ -333,6 +333,171 @@ class DelayCalibrationTests(unittest.TestCase):
         )
         self.assertFalse(pipeline.rejected_observations)
 
+    def test_drifting_clock_uses_gradual_offsets(self) -> None:
+        clock = SensorClockModel.linear("rear_wheels", offset=0.10, drift=0.04)
+        self.assertAlmostEqual(clock.offset_at(0.0), 0.10)
+        self.assertAlmostEqual(clock.offset_at(5.0), 0.30)
+        self.assertAlmostEqual(clock.offset_at(10.0), 0.50)
+        wheel = WheelObservation(5.0, "rear_wheels", 7, 4.7, 0.0)
+        calibration = DelayCalibration().with_clock(clock)
+        self.assertAlmostEqual(calibration.corrected_time(wheel), 4.7)
+
+    def test_drift_comparison_preserves_identities_and_shows_order_changes(self) -> None:
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"rear_wheels": 0.10, "imu": 0.12})
+        )
+        observations = [
+            WheelObservation(2.00, "rear_wheels", 1, 1.9, 0.0),
+            ImuObservation(2.10, "imu", 1, 0.0, 0.0),
+            WheelObservation(3.00, "rear_wheels", 2, 2.9, 0.0),
+            ImuObservation(3.05, "imu", 2, 0.0, 0.0),
+        ]
+        for item in observations:
+            pipeline.add_observation(item)
+            pipeline.process_until(item.time + 0.2)
+        comparison = pipeline.stage_sensor_clock(
+            "rear_wheels",
+            anchors=[(2.0, 1.9), (3.0, 2.96)],
+        )
+        by_identity = {item.identity: item for item in comparison.timeline}
+        self.assertEqual(len(by_identity), len(observations))
+        first_wheel = by_identity[("rear_wheels", 1)]
+        self.assertAlmostEqual(first_wheel.baseline_time, 1.9)
+        self.assertAlmostEqual(first_wheel.candidate_time, 1.9)
+        second_wheel = by_identity[("rear_wheels", 2)]
+        self.assertAlmostEqual(second_wheel.baseline_time, 2.9)
+        self.assertAlmostEqual(second_wheel.candidate_time, 2.96)
+        self.assertGreater(second_wheel.order_delta, 0)
+        identities = [change.identity for change in comparison.position_changes]
+        self.assertEqual(len(identities), len(set(identities)))
+        pipeline.discard_staged_delay()
+        self.assertEqual(pipeline.calibration.delay_for("rear_wheels"), 0.10)
+
+    def test_drift_crossing_seal_has_explicit_decision_and_does_not_change_history(self) -> None:
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"rear_wheels": 0.10, "imu": 0.12})
+        )
+        items = [
+            WheelObservation(5.15, "rear_wheels", 1, 4.8, 0.0),
+            ImuObservation(5.20, "imu", 1, 0.0, 0.0),
+            WheelObservation(5.40, "rear_wheels", 2, 5.3, 0.0),
+            ImuObservation(6.00, "imu", 2, 0.0, 0.0),
+        ]
+        for item in items:
+            pipeline.add_observation(item)
+            pipeline.process_until(item.time + 0.2)
+        pipeline.seal_until(5.0)
+        sealed_before = [
+            (state.time, state.x, state.y) for state in pipeline.sealed_outputs
+        ]
+        comparison = pipeline.stage_sensor_clock(
+            "rear_wheels", anchors=[(5.15, 4.75), (5.4, 5.2)]
+        )
+        classifications = {
+            item.sequence: item.classification for item in comparison.decisions
+        }
+        self.assertEqual(classifications[1], "crossing_rejected")
+        self.assertEqual(classifications[2], "open_recomputed")
+        pipeline.publish_staged_delay()
+        self.assertEqual(
+            [(state.time, state.x, state.y) for state in pipeline.sealed_outputs],
+            sealed_before,
+        )
+        self.assertIn(("rear_wheels", 1), pipeline.rejected_observations)
+
+    def test_unfinished_drift_restores_from_checkpoint_for_publish_or_discard(self) -> None:
+        pipeline = LocalizationPipeline(DelayCalibration({"imu": 0.12}))
+        first = WheelObservation(1.0, "rear_wheels", 1, 1.0, 0.0)
+        imu = ImuObservation(1.1, "imu", 1, 0.0, 0.0)
+        pipeline.add_observation(first)
+        pipeline.process_until(1.0)
+        pipeline.stage_sensor_clock(
+            "rear_wheels", anchors=[(1.0, 0.9), (2.0, 1.7)]
+        )
+        checkpoint = pipeline.save_checkpoint()
+        resumed = LocalizationPipeline()
+        resumed.restore_checkpoint(checkpoint)
+        self.assertEqual(resumed.staged_sensor, "rear_wheels")
+        second = WheelObservation(2.0, "rear_wheels", 2, 2.0, 0.0)
+        resumed.add_observation(second)
+        resumed.add_observation(imu)
+        resumed.process_until(2.0)
+        report = resumed.publish_staged_delay()
+        self.assertEqual(report.sensor, "rear_wheels")
+        self.assertAlmostEqual(resumed.calibration.offset_for("rear_wheels", 2.0), 0.3)
+        self.assertEqual(second.time, 2.0)
+
+    def test_rejected_identity_can_be_adopted_when_later_revision_moves_it_open(self) -> None:
+        pipeline = LocalizationPipeline(
+            calibration=DelayCalibration({"rear_wheels": 0.10, "imu": 0.12})
+        )
+        items = [
+            WheelObservation(5.15, "rear_wheels", 1, 4.8, 0.0),
+            ImuObservation(5.20, "imu", 1, 0.0, 0.0),
+            WheelObservation(5.40, "rear_wheels", 2, 5.3, 0.0),
+            ImuObservation(6.00, "imu", 2, 0.0, 0.0),
+        ]
+        for item in items:
+            pipeline.add_observation(item)
+            pipeline.process_until(item.time + 0.2)
+        pipeline.seal_until(5.0)
+        pipeline.stage_sensor_clock(
+            "rear_wheels", anchors=[(5.15, 4.75), (5.4, 5.2)]
+        )
+        pipeline.publish_staged_delay()
+        without_adoption = len(pipeline.outputs)
+        readoption = pipeline.stage_sensor_delay("rear_wheels", 0.0)
+        decision = next(
+            item for item in readoption.decisions if item.sequence == 1
+        )
+        self.assertEqual(decision.classification, "open_adopted")
+        pipeline.publish_staged_delay()
+        self.assertGreater(len(pipeline.outputs), without_adoption)
+        self.assertIn(("rear_wheels", 1), pipeline.rejected_observations)
+        self.assertEqual(items[0].time, 5.15)
+
+    def test_unfinished_drift_survives_file_reopen_and_discard(self) -> None:
+        pipeline = LocalizationPipeline(DelayCalibration({"imu": 0.12}))
+        wheel = WheelObservation(1.0, "rear_wheels", 1, 1.0, 0.0)
+        pipeline.add_observation(wheel)
+        pipeline.process_until(1.0)
+        pipeline.stage_sensor_clock(
+            "rear_wheels", anchors=[(1.0, 0.8), (2.0, 1.7)]
+        )
+        checkpoint = pipeline.save_checkpoint()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            CheckpointStore(path).save(
+                checkpoint.state,
+                checkpoint.visible_observations,
+                calibration=checkpoint.calibration.as_dict(),
+                arrival_horizon=checkpoint.arrival_horizon,
+                seal_time=checkpoint.seal_time,
+                sealed_outputs=checkpoint.sealed_outputs,
+                rejected_observations=checkpoint.rejected_observations,
+                staged_calibration=checkpoint.staged_calibration.as_dict(),
+                staged_sensor=checkpoint.staged_sensor,
+            )
+            state, observations, metadata = CheckpointStore(path).load_with_metadata()
+            restored_checkpoint = type(checkpoint)(
+                state=state,
+                event_count=checkpoint.event_count,
+                arrival_horizon=metadata["arrival_horizon"],
+                seal_time=metadata["seal_time"],
+                calibration=DelayCalibration(metadata["clock_models"]),
+                visible_observations=observations,
+                sealed_outputs=metadata["sealed_outputs"],
+                rejected_observations=metadata["rejected_observations"],
+                staged_calibration=DelayCalibration(metadata["staged_calibration"]),
+                staged_sensor=metadata["staged_sensor"],
+            )
+        resumed = LocalizationPipeline()
+        resumed.restore_checkpoint(restored_checkpoint)
+        self.assertEqual(resumed.staged_sensor, "rear_wheels")
+        resumed.discard_staged_delay()
+        self.assertEqual(resumed.calibration.offset_for("rear_wheels", 1.0), 0.0)
+        self.assertEqual(wheel.time, 1.0)
+
     def test_reseal_save_restore_preserve_timeline(self) -> None:
         source = delayed_source()
         pipeline = LocalizationPipeline(
@@ -402,10 +567,16 @@ class DelayCalibrationTests(unittest.TestCase):
                 event_count=len(metadata["sealed_outputs"]),
                 arrival_horizon=metadata["arrival_horizon"],
                 seal_time=metadata["seal_time"],
-                calibration=DelayCalibration(metadata["fixed_delays"]),
+                calibration=DelayCalibration(metadata["clock_models"]),
                 visible_observations=observations,
                 sealed_outputs=metadata["sealed_outputs"],
                 rejected_observations=metadata["rejected_observations"],
+                staged_calibration=(
+                    DelayCalibration(metadata["staged_calibration"])
+                    if metadata["staged_calibration"]
+                    else None
+                ),
+                staged_sensor=metadata["staged_sensor"],
             )
         resumed = LocalizationPipeline()
         resumed.restore_checkpoint(loaded_checkpoint)

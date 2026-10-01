@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 
-from .calibration import DelayCalibration
+from .calibration import DelayCalibration, SensorClockModel
 from .estimator import LocalizationEstimator, StateEstimate
 from .types import Observation
 
@@ -17,6 +17,8 @@ class Checkpoint:
     visible_observations: list[Observation] = field(default_factory=list)
     sealed_outputs: list[StateEstimate] = field(default_factory=list)
     rejected_observations: dict[tuple[str, int], str] = field(default_factory=dict)
+    staged_calibration: DelayCalibration | None = None
+    staged_sensor: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +33,8 @@ class RecomputeReport:
     boundary_state_time: float | None = None
     adopted_observations: tuple[int, ...] = ()
     rejected_observations: tuple["ObservationDecision", ...] = ()
+    timeline_changes: tuple["TimelinePositionChange", ...] = ()
+    uncertain_intervals: tuple["UncertainInterval", ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +43,9 @@ class ObservationDecision:
     sequence: int
     stamp: float
     arrival_time: float | None
+    baseline_corrected_time: float
     corrected_time: float
+    time_shift: float
     classification: str
     reason: str
 
@@ -52,6 +58,7 @@ class DelaySettingView:
     open_sequences: tuple[int, ...]
     sealed_sequences: tuple[int, ...]
     rejected_sequences: tuple[int, ...]
+    clock: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +70,44 @@ class DelayComparison:
     sealed_history: tuple[float, float] | None
     boundary_state_time: float | None
     decisions: tuple[ObservationDecision, ...]
+    timeline: tuple["TimelinePosition", ...]
+    position_changes: tuple["TimelinePositionChange", ...]
+    uncertain_intervals: tuple["UncertainInterval", ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TimelinePosition:
+    identity: tuple[str, int]
+    sensor: str
+    sequence: int
+    stamp: float
+    arrival_time: float | None
+    baseline_time: float
+    candidate_time: float
+    time_shift: float
+    baseline_order: int
+    candidate_order: int
+    order_delta: int
+    classification: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class TimelinePositionChange:
+    identity: tuple[str, int]
+    baseline_time: float
+    candidate_time: float
+    baseline_x: float | None = None
+    baseline_y: float | None = None
+    candidate_x: float | None = None
+    candidate_y: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UncertainInterval:
+    start: float
+    end: float
+    reason: str
 
 
 class SealedHistoryError(RuntimeError):
@@ -110,6 +155,7 @@ class LocalizationPipeline:
         self.rejected_observations: dict[tuple[str, int], str] = {}
         self.staged_calibration: DelayCalibration | None = None
         self.staged_comparison: DelayComparison | None = None
+        self.staged_sensor: str | None = None
 
     # ------------------------------------------------------------------ ingest
 
@@ -153,6 +199,8 @@ class LocalizationPipeline:
                 self._visible(arrival_horizon),
                 [self._clone_state(item) for item in self.sealed_outputs],
                 dict(self.rejected_observations),
+                self.staged_calibration,
+                self.staged_sensor,
             )
         )
         return list(self.outputs)
@@ -199,6 +247,8 @@ class LocalizationPipeline:
                 self._visible(self.arrival_horizon),
                 [self._clone_state(item) for item in self.sealed_outputs],
                 dict(self.rejected_observations),
+                self.staged_calibration,
+                self.staged_sensor,
             )
         )
         return list(self.sealed_outputs)
@@ -207,26 +257,54 @@ class LocalizationPipeline:
         """Prepare a delay revision without publishing it."""
         delay = float(delay)
         candidate = self.calibration.with_delay(sensor, delay)
+        return self._stage_calibration(sensor, candidate)
+
+    def stage_sensor_clock(
+        self,
+        sensor: str,
+        *,
+        offset: float = 0.0,
+        drift: float = 0.0,
+        anchors: list[tuple[float, float]] | None = None,
+    ) -> DelayComparison:
+        """Prepare a drifting-clock revision without publishing it."""
+        candidate = self.calibration.with_sensor_clock(
+            sensor, offset=offset, drift=drift, anchors=anchors
+        )
+        return self._stage_calibration(sensor, candidate)
+
+    def stage_clock_model(self, model: SensorClockModel) -> DelayComparison:
+        return self._stage_calibration(model.sensor, self.calibration.with_clock(model))
+
+    def _stage_calibration(
+        self, sensor: str, candidate: DelayCalibration
+    ) -> DelayComparison:
         comparison = self.compare_calibrations(sensor, self.calibration, candidate)
         self.staged_calibration = candidate
         self.staged_comparison = comparison
+        self.staged_sensor = sensor
         return comparison
 
     def discard_staged_delay(self) -> None:
         """Discard a delay revision that has not been published."""
         self.staged_calibration = None
         self.staged_comparison = None
+        self.staged_sensor = None
 
     def publish_staged_delay(self) -> RecomputeReport:
         if self.staged_calibration is None or self.staged_comparison is None:
             raise RuntimeError("no staged delay revision to publish")
+        self.staged_comparison = self.compare_calibrations(
+            self.staged_sensor or "", self.calibration, self.staged_calibration
+        )
         comparison = self.staged_comparison
-        old_delay = comparison.baseline.delay
-        new_delay = comparison.candidate.delay
+        old_delay = self.calibration.delay_for(comparison.sensor)
+        new_delay = self.staged_calibration.delay_for(comparison.sensor)
         self.calibration = self.staged_calibration
         for decision in comparison.decisions:
             if decision.classification == "crossing_rejected":
                 self.rejected_observations[(decision.sensor, decision.sequence)] = decision.reason
+        staged_sensor = comparison.sensor
         self.discard_staged_delay()
         self._restore_anchor_and_rebuild()
         interval = comparison.baseline.corrected_interval
@@ -245,6 +323,8 @@ class LocalizationPipeline:
                 for decision in comparison.decisions
                 if decision.classification == "crossing_rejected"
             ),
+            comparison.position_changes,
+            comparison.uncertain_intervals,
         )
 
     def set_sensor_delay(self, sensor: str, delay: float) -> RecomputeReport:
@@ -267,19 +347,18 @@ class LocalizationPipeline:
             item
             for item in visible
             if item.sensor == sensor
-            and (item.sensor, item.sequence) not in self.rejected_observations
         ]
         decisions = tuple(
             self._observation_decision(item, baseline, candidate)
             for item in affected
         )
-        baseline_view = self._setting_view(sensor, baseline.delay_for(sensor), affected, baseline, candidate)
-        candidate_view = self._setting_view(sensor, candidate.delay_for(sensor), affected, baseline, candidate)
+        baseline_view = self._setting_view(sensor, affected, baseline)
+        candidate_view = self._setting_view(sensor, affected, candidate, baseline)
+        accepted_classes = {"open_recomputed", "open_adopted"}
         open_times = [
-            candidate.corrected_time(item)
-            for item in affected
-            if self._observation_decision(item, baseline, candidate).classification
-            in {"open_recomputed", "open_adopted"}
+            item.corrected_time
+            for item in decisions
+            if item.classification in accepted_classes
         ]
         if open_times:
             recomputable_range = (min(open_times), max(open_times))
@@ -288,6 +367,10 @@ class LocalizationPipeline:
         else:
             recomputable_range = None
         sealed_history = (0.0, self.seal_time) if self.seal_time is not None else None
+        timeline, position_changes = self._compare_timeline_positions(
+            visible, affected, baseline, candidate, decisions
+        )
+        uncertain_intervals = self._open_gaps(candidate)
         return DelayComparison(
             sensor,
             baseline_view,
@@ -296,6 +379,9 @@ class LocalizationPipeline:
             sealed_history,
             self.sealed_outputs[-1].time if self.sealed_outputs else self.seal_time,
             decisions,
+            timeline,
+            position_changes,
+            uncertain_intervals,
         )
 
     # ------------------------------------------------------------- inspection
@@ -331,6 +417,8 @@ class LocalizationPipeline:
             self._visible(self.arrival_horizon),
             [self._clone_state(item) for item in self.sealed_outputs],
             dict(self.rejected_observations),
+            self.staged_calibration,
+            self.staged_sensor,
         )
         self.checkpoints.append(checkpoint)
         return checkpoint
@@ -368,6 +456,14 @@ class LocalizationPipeline:
             self._rebuild_tail(events)
             if self.arrival_horizon is not None:
                 self.estimator.predict(self.arrival_horizon)
+        self.staged_calibration = checkpoint.staged_calibration
+        self.staged_sensor = checkpoint.staged_sensor
+        if self.staged_calibration is not None and self.staged_sensor:
+            self.staged_comparison = self.compare_calibrations(
+                self.staged_sensor, self.calibration, self.staged_calibration
+            )
+        else:
+            self.staged_comparison = None
         self.checkpoints = [checkpoint]
 
     def replay(self) -> list[StateEstimate]:
@@ -383,7 +479,12 @@ class LocalizationPipeline:
     # ------------------------------------------------------------- internals
 
     def _retime(self, observation: Observation) -> Observation:
-        corrected = self.calibration.corrected_time(observation)
+        return self._retime_with(observation, self.calibration)
+
+    def _retime_with(
+        self, observation: Observation, calibration: DelayCalibration
+    ) -> Observation:
+        corrected = calibration.corrected_time(observation)
         if abs(corrected - observation.time) <= 1e-12:
             return observation
         return type(observation)(
@@ -404,9 +505,10 @@ class LocalizationPipeline:
         estimator.restore(state)
         return estimator
 
-    def _sort_key(self, observation: Observation):
+    def _sort_key(self, observation: Observation, calibration: DelayCalibration | None = None):
+        calibration = calibration or self.calibration
         return (
-            self.calibration.corrected_time(observation),
+            calibration.corrected_time(observation),
             observation.sensor,
             observation.sequence,
         )
@@ -421,21 +523,42 @@ class LocalizationPipeline:
         ]
 
     def _eligible(self, arrival_horizon: float | None) -> list[Observation]:
-        visible = [
-            item
-            for item in self._visible(arrival_horizon)
-            if (item.sensor, item.sequence) not in self.rejected_observations
-        ]
+        visible = self._visible(arrival_horizon)
+        if self.seal_time is not None:
+            visible = [
+                item
+                for item in visible
+                if self.calibration.corrected_time(item) > self.seal_time + 1e-9
+            ]
         return sorted(visible, key=lambda item: self._sort_key(item))
 
-    def _tail_events(self, events: list[Observation] | None = None) -> list[Observation]:
+    def _eligible_with(
+        self,
+        arrival_horizon: float | None,
+        calibration: DelayCalibration,
+    ) -> list[Observation]:
+        visible = self._visible(arrival_horizon)
+        if self.seal_time is not None:
+            visible = [
+                item
+                for item in visible
+                if calibration.corrected_time(item) > self.seal_time + 1e-9
+            ]
+        return sorted(visible, key=lambda item: self._sort_key(item, calibration))
+
+    def _tail_events(
+        self,
+        events: list[Observation] | None = None,
+        calibration: DelayCalibration | None = None,
+    ) -> list[Observation]:
+        calibration = calibration or self.calibration
         events = events if events is not None else self._eligible(self.arrival_horizon)
         if self.seal_time is None:
             return events
         return [
             item
             for item in events
-            if self.calibration.corrected_time(item) > self.seal_time + 1e-9
+            if calibration.corrected_time(item) > self.seal_time + 1e-9
         ]
 
     def _boundary_state(
@@ -492,12 +615,15 @@ class LocalizationPipeline:
         else:
             classification = "open_adopted"
             reason = "候选延迟把观测移到封存边界之后，从封存边界状态开始参与开放重算"
+        time_shift = old_time - new_time
         return ObservationDecision(
             observation.sensor,
             observation.sequence,
             observation.time,
             observation.arrival_time,
+            old_time,
             new_time,
+            time_shift,
             classification,
             reason,
         )
@@ -505,21 +631,22 @@ class LocalizationPipeline:
     def _setting_view(
         self,
         sensor: str,
-        delay: float,
         affected: list[Observation],
-        baseline: DelayCalibration,
-        candidate: DelayCalibration,
+        view_calibration: DelayCalibration,
+        baseline: DelayCalibration | None = None,
     ) -> DelaySettingView:
-        times = [item.time - delay for item in affected]
+        baseline = baseline or view_calibration
+        delay = view_calibration.delay_for(sensor)
+        times = [view_calibration.corrected_time(item) for item in affected]
         open_sequences = []
         sealed_sequences = []
         rejected_sequences = []
         for item in affected:
-            decision = self._observation_decision(item, baseline, candidate)
-            corrected = item.time - delay
+            decision = self._observation_decision(item, baseline, view_calibration)
+            corrected = view_calibration.corrected_time(item)
             if self.seal_time is not None and corrected <= self.seal_time + 1e-9:
                 sealed_sequences.append(item.sequence)
-            if decision.classification == "crossing_rejected" and delay == candidate.delay_for(sensor):
+            if decision.classification == "crossing_rejected":
                 rejected_sequences.append(item.sequence)
             if corrected > (self.seal_time if self.seal_time is not None else -1e300) + 1e-9:
                 open_sequences.append(item.sequence)
@@ -530,7 +657,123 @@ class LocalizationPipeline:
             tuple(open_sequences),
             tuple(sealed_sequences),
             tuple(rejected_sequences),
+            view_calibration.clock_for(sensor),
         )
+
+    def _compare_timeline_positions(
+        self,
+        visible: list[Observation],
+        affected: list[Observation],
+        baseline: DelayCalibration,
+        candidate: DelayCalibration,
+        decisions: tuple[ObservationDecision, ...],
+    ) -> tuple[tuple[TimelinePosition, ...], tuple[TimelinePositionChange, ...]]:
+        affected_keys = {(item.sensor, item.sequence) for item in affected}
+        decision_by_key = {(item.sensor, item.sequence): item for item in decisions}
+        baseline_events = self._eligible_with(self.arrival_horizon, baseline)
+        candidate_events = self._eligible_with(self.arrival_horizon, candidate)
+        baseline_states = self._simulate_event_states(baseline_events, baseline)
+        candidate_states = self._simulate_event_states(candidate_events, candidate)
+        baseline_order = {
+            (item.sensor, item.sequence): index
+            for index, item in enumerate(baseline_events)
+        }
+        candidate_order = {
+            (item.sensor, item.sequence): index
+            for index, item in enumerate(candidate_events)
+        }
+        timeline: list[TimelinePosition] = []
+        position_changes: list[TimelinePositionChange] = []
+        for observation in sorted(visible, key=lambda item: (item.sensor, item.sequence)):
+            key = (observation.sensor, observation.sequence)
+            old_time = baseline.corrected_time(observation)
+            new_time = candidate.corrected_time(observation)
+            decision = decision_by_key.get(key)
+            if decision is not None:
+                classification = decision.classification
+                reason = decision.reason
+            elif key in self.rejected_observations:
+                classification = "previously_rejected"
+                reason = self.rejected_observations[key]
+            else:
+                classification = "identity_unchanged"
+                reason = "来源与序号不变，仅在新的全局顺序中定位"
+            old_order = baseline_order.get(key)
+            new_order = candidate_order.get(key)
+            timeline.append(
+                TimelinePosition(
+                    key,
+                    observation.sensor,
+                    observation.sequence,
+                    observation.time,
+                    observation.arrival_time,
+                    old_time,
+                    new_time,
+                    old_time - new_time,
+                    -1 if old_order is None else old_order,
+                    -1 if new_order is None else new_order,
+                    0 if old_order is None or new_order is None else new_order - old_order,
+                    classification,
+                    reason,
+                )
+            )
+            if key in affected_keys:
+                old_state = baseline_states.get(key)
+                new_state = candidate_states.get(key)
+                position_changes.append(
+                    TimelinePositionChange(
+                        key,
+                        old_time,
+                        new_time,
+                        None if old_state is None else old_state.x,
+                        None if old_state is None else old_state.y,
+                        None if new_state is None else new_state.x,
+                        None if new_state is None else new_state.y,
+                    )
+                )
+        return tuple(timeline), tuple(position_changes)
+
+    def _simulate_event_states(
+        self, events: list[Observation], calibration: DelayCalibration
+    ) -> dict[tuple[str, int], StateEstimate]:
+        estimator = LocalizationEstimator()
+        if self.sealed_outputs:
+            estimator.restore(self.sealed_outputs[-1])
+        states: dict[tuple[str, int], StateEstimate] = {}
+        for observation in events:
+            estimator.step(self._retime_with(observation, calibration))
+            states[(observation.sensor, observation.sequence)] = estimator.snapshot()
+        return states
+
+    def _open_gaps(self, calibration: DelayCalibration) -> tuple[UncertainInterval, ...]:
+        events = self._eligible_with(self.arrival_horizon, calibration)
+        estimator = LocalizationEstimator()
+        thresholds = {
+            sensor: estimator.wheel_timeout if "wheel" in sensor else estimator.imu_timeout
+            for sensor in {item.sensor for item in events}
+        }
+        gaps: list[UncertainInterval] = []
+        for sensor, timeout in thresholds.items():
+            times = [
+                calibration.corrected_time(item)
+                for item in events
+                if item.sensor == sensor
+            ]
+            if not times:
+                continue
+            start_boundary = self.seal_time if self.seal_time is not None else times[0]
+            end_boundary = self.arrival_horizon if self.arrival_horizon is not None else times[-1]
+            boundaries = [start_boundary, *times, end_boundary]
+            for start, end in zip(boundaries, boundaries[1:]):
+                if end - start > timeout + 1e-9:
+                    gaps.append(
+                        UncertainInterval(
+                            start,
+                            end,
+                            f"{sensor} 在开放区间缺少 {end - start:.3f}s 观测，位置仍需预测",
+                        )
+                    )
+        return tuple(gaps)
 
     def _trim_checkpoints(self) -> None:
         if self.sealed_outputs:
@@ -577,6 +820,8 @@ class LocalizationPipeline:
                     self._visible(self.arrival_horizon),
                     [self._clone_state(item) for item in self.sealed_outputs],
                     dict(self.rejected_observations),
+                    self.staged_calibration,
+                    self.staged_sensor,
                 )
             )
 

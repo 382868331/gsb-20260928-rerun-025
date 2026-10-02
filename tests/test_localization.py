@@ -6,7 +6,14 @@ from pathlib import Path
 import numpy as np
 
 from robot_localization.estimator import LocalizationEstimator
-from robot_localization.calibration import DelayCalibration, SensorClockModel
+from robot_localization.calibration import (
+    ClockAnchor,
+    ClockSegment,
+    DelayCalibration,
+    RebootBoundary,
+    SegmentedSensorClock,
+    SensorClockModel,
+)
 from robot_localization.pipeline import LocalizationPipeline
 from robot_localization.recording import (
     CheckpointStore,
@@ -361,10 +368,10 @@ class DelayCalibrationTests(unittest.TestCase):
         )
         by_identity = {item.identity: item for item in comparison.timeline}
         self.assertEqual(len(by_identity), len(observations))
-        first_wheel = by_identity[("rear_wheels", 1)]
+        first_wheel = by_identity[("rear_wheels", None, 1)]
         self.assertAlmostEqual(first_wheel.baseline_time, 1.9)
         self.assertAlmostEqual(first_wheel.candidate_time, 1.9)
-        second_wheel = by_identity[("rear_wheels", 2)]
+        second_wheel = by_identity[("rear_wheels", None, 2)]
         self.assertAlmostEqual(second_wheel.baseline_time, 2.9)
         self.assertAlmostEqual(second_wheel.candidate_time, 2.96)
         self.assertGreater(second_wheel.order_delta, 0)
@@ -403,7 +410,7 @@ class DelayCalibrationTests(unittest.TestCase):
             [(state.time, state.x, state.y) for state in pipeline.sealed_outputs],
             sealed_before,
         )
-        self.assertIn(("rear_wheels", 1), pipeline.rejected_observations)
+        self.assertIn(("rear_wheels", None, 1), pipeline.rejected_observations)
 
     def test_unfinished_drift_restores_from_checkpoint_for_publish_or_discard(self) -> None:
         pipeline = LocalizationPipeline(DelayCalibration({"imu": 0.12}))
@@ -453,7 +460,7 @@ class DelayCalibrationTests(unittest.TestCase):
         self.assertEqual(decision.classification, "open_adopted")
         pipeline.publish_staged_delay()
         self.assertGreater(len(pipeline.outputs), without_adoption)
-        self.assertIn(("rear_wheels", 1), pipeline.rejected_observations)
+        self.assertIn(("rear_wheels", None, 1), pipeline.rejected_observations)
         self.assertEqual(items[0].time, 5.15)
 
     def test_unfinished_drift_survives_file_reopen_and_discard(self) -> None:
@@ -634,6 +641,143 @@ class DelayCalibrationTests(unittest.TestCase):
         self.assertEqual(boundary_at_checkpoint, after)
         # Messages that arrived after the checkpoint stay hidden.
         self.assertEqual(len(restored.received), len(prior))
+
+    def test_two_reboots_keep_equal_stamps_as_distinct_observations(self) -> None:
+        first = WheelObservation(
+            0.5, "rear_wheels", 1, 1.0, 0.0,
+            arrival_time=2.0, clock_segment="a",
+        )
+        second = WheelObservation(
+            0.5, "rear_wheels", 1, 1.0, 0.0,
+            arrival_time=6.0, clock_segment="b",
+        )
+        third = WheelObservation(
+            0.5, "rear_wheels", 1, 1.0, 0.0,
+            arrival_time=10.0, clock_segment="c",
+        )
+        late_from_first = WheelObservation(
+            1.5, "rear_wheels", 2, 1.0, 0.0,
+            arrival_time=11.0, clock_segment="a",
+        )
+        all_reboot_observations = (first, second, third, late_from_first)
+        clock = SegmentedSensorClock(
+            "rear_wheels",
+            (
+                ClockSegment(
+                    "a",
+                    (ClockAnchor(0.5, 1.0), ClockAnchor(1.5, 2.1)),
+                    0,
+                    2,
+                ),
+                ClockSegment("b", (ClockAnchor(0.0, 5.0),), 0, 10),
+                ClockSegment("c", (ClockAnchor(0.0, 9.0),), 0, 10),
+            ),
+            (
+                RebootBoundary(10, reason="明确重启"),
+                RebootBoundary(10, reason="第二次重启"),
+            ),
+        )
+        calibration = DelayCalibration().with_segmented_clock(clock)
+        self.assertEqual(
+            [calibration.corrected_time(item) for item in all_reboot_observations],
+            [1.0, 5.5, 9.5, 2.1],
+        )
+        pipeline = LocalizationPipeline(calibration=calibration)
+        for item in all_reboot_observations:
+            pipeline.add_observation(item)
+            pipeline.process_until(item.observed_at())
+        events = pipeline._eligible(11.0)
+        self.assertEqual(len({item.identity() for item in events}), 4)
+        self.assertEqual(
+            [calibration.corrected_time(item) for item in events],
+            [1.0, 2.1, 5.5, 9.5],
+        )
+
+    def test_single_uncertain_anchor_retains_time_range(self) -> None:
+        segment = ClockSegment(
+            "after_reboot",
+            (ClockAnchor(0.0, 6.0, corrected_time_min=5.9, corrected_time_max=6.2),),
+            first_sequence=0,
+            drift_rate_bounds=(-0.02, 0.03),
+        )
+        low, high = segment.time_bounds_at(1.0)
+        self.assertAlmostEqual(low, 6.87)
+        self.assertAlmostEqual(high, 7.22)
+        pipeline = LocalizationPipeline()
+        item = WheelObservation(
+            1.0, "rear_wheels", 1, 1.0, 0.0,
+            arrival_time=8.0, clock_segment="after_reboot",
+        )
+        pipeline.add_observation(item)
+        pipeline.process_until(8.0)
+        comparison = pipeline.stage_clock_segment("rear_wheels", segment)
+        decision = comparison.decisions[0]
+        self.assertEqual(decision.clock_segment, "after_reboot")
+        self.assertAlmostEqual(decision.corrected_time, 7.0)
+        self.assertAlmostEqual(decision.corrected_time_min, 6.87)
+        self.assertAlmostEqual(decision.corrected_time_max, 7.22)
+        self.assertIn("只能确定轨迹时间范围", decision.reason)
+
+    def test_segment_confirmation_is_independent_and_survives_checkpoint(self) -> None:
+        observations = [
+            WheelObservation(1.0, "rear_wheels", 1, 1.0, 0.0, clock_segment="a"),
+            WheelObservation(1.0, "rear_wheels", 1, 1.0, 0.0, clock_segment="b"),
+        ]
+        pipeline = LocalizationPipeline()
+        for item in observations:
+            pipeline.add_observation(item)
+        pipeline.process_until(2.0)
+        segment_a = ClockSegment("a", (ClockAnchor(1.0, 2.0),), 0, 10)
+        segment_b = ClockSegment("b", (ClockAnchor(1.0, 4.0),), 0, 10)
+        pipeline.stage_clock_segment("rear_wheels", segment_a)
+        pipeline.publish_staged_delay()
+        comparison_b = pipeline.stage_clock_segment("rear_wheels", segment_b)
+        self.assertEqual(
+            comparison_b.timeline[0].candidate_time, 2.0
+        )
+        self.assertEqual(
+            comparison_b.timeline[1].candidate_time, 4.0
+        )
+        checkpoint = pipeline.save_checkpoint()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            store = CheckpointStore(path)
+            store.save(
+                checkpoint.state,
+                checkpoint.visible_observations,
+                calibration=checkpoint.calibration.as_dict(),
+                arrival_horizon=checkpoint.arrival_horizon,
+                seal_time=checkpoint.seal_time,
+                sealed_outputs=checkpoint.sealed_outputs,
+                rejected_observations=checkpoint.rejected_observations,
+                staged_calibration=checkpoint.staged_calibration.as_dict(),
+                staged_sensor=checkpoint.staged_sensor,
+            )
+            state, restored_observations, metadata = store.load_with_metadata()
+            restored_checkpoint = type(checkpoint)(
+                state=state,
+                event_count=checkpoint.event_count,
+                arrival_horizon=metadata["arrival_horizon"],
+                seal_time=metadata["seal_time"],
+                calibration=DelayCalibration(metadata["clock_models"]),
+                visible_observations=restored_observations,
+                sealed_outputs=metadata["sealed_outputs"],
+                rejected_observations=metadata["rejected_observations"],
+                staged_calibration=DelayCalibration(metadata["staged_calibration"]),
+                staged_sensor=metadata["staged_sensor"],
+            )
+        resumed = LocalizationPipeline()
+        resumed.restore_checkpoint(restored_checkpoint)
+        resumed.discard_staged_delay()
+        clock = resumed.calibration.clock_for("rear_wheels")
+        self.assertIsInstance(clock, SegmentedSensorClock)
+        self.assertEqual([item.segment_id for item in clock.segments], ["a"])
+        self.assertAlmostEqual(
+            resumed.calibration.corrected_time(observations[0]), 2.0
+        )
+        self.assertAlmostEqual(
+            resumed.calibration.corrected_time(observations[1]), 1.0
+        )
 
 
 if __name__ == "__main__":

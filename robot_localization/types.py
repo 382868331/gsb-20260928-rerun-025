@@ -9,6 +9,7 @@ class Observation:
     sensor: str
     sequence: int
     arrival_time: float | None = field(default=None, kw_only=True)
+    clock_segment: int | str | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.time < 0.0:
@@ -19,6 +20,9 @@ class Observation:
     def observed_at(self) -> float:
         """Wall-clock time when the message actually arrived."""
         return self.time if self.arrival_time is None else self.arrival_time
+
+    def identity(self) -> tuple[str, int | str | None, int]:
+        return (self.sensor, self.clock_segment, self.sequence)
 
 
 @dataclass(frozen=True, slots=True)

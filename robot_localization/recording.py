@@ -45,7 +45,7 @@ class CheckpointStore:
         arrival_horizon: float | None = None,
         seal_time: float | None = None,
         sealed_outputs: list[StateEstimate] | None = None,
-        rejected_observations: dict[tuple[str, int], str] | None = None,
+        rejected_observations: dict[tuple[str, int | str | None, int], str] | None = None,
         staged_calibration: dict[str, object] | None = None,
         staged_sensor: str | None = None,
     ) -> None:
@@ -80,10 +80,11 @@ class CheckpointStore:
             "rejected_observations": [
                 {
                     "sensor": sensor,
+                    "clock_segment": clock_segment,
                     "sequence": sequence,
                     "reason": reason,
                 }
-                for (sensor, sequence), reason in (rejected_observations or {}).items()
+                for (sensor, clock_segment, sequence), reason in (rejected_observations or {}).items()
             ],
         }
         Path(self.path).write_text(json.dumps(payload), encoding="utf-8")
@@ -120,7 +121,7 @@ class CheckpointStore:
                 deserialize_state(item) for item in payload.get("sealed_outputs", [])
             ],
             "rejected_observations": {
-                (item["sensor"], item["sequence"]): item["reason"]
+                (item["sensor"], item.get("clock_segment"), item["sequence"]): item["reason"]
                 for item in payload.get("rejected_observations", [])
             },
             "staged_calibration": payload.get("staged_calibration"),

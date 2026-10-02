@@ -1,6 +1,14 @@
 """Offline causal robot localization core."""
 
-from .calibration import ClockAnchor, DelayCalibration, SensorClockModel, SensorDelayModel
+from .calibration import (
+    ClockAnchor,
+    ClockSegment,
+    DelayCalibration,
+    RebootBoundary,
+    SegmentedSensorClock,
+    SensorClockModel,
+    SensorDelayModel,
+)
 from .estimator import LocalizationEstimator, StateEstimate
 from .pipeline import (
     DelayComparison,
@@ -24,6 +32,9 @@ __all__ = [
     "SensorDelayModel",
     "SensorClockModel",
     "ClockAnchor",
+    "ClockSegment",
+    "RebootBoundary",
+    "SegmentedSensorClock",
     "DelayCalibration",
     "LocalizationEstimator",
     "StateEstimate",

@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 
-from .calibration import DelayCalibration, SensorClockModel
+from .calibration import (
+    ClockSegment,
+    DelayCalibration,
+    RebootBoundary,
+    SegmentedSensorClock,
+    SensorClockModel,
+)
 from .estimator import LocalizationEstimator, StateEstimate
 from .types import Observation
+
+ObservationKey = tuple[str, int | str | None, int]
 
 
 @dataclass(slots=True)
@@ -16,7 +24,7 @@ class Checkpoint:
     calibration: DelayCalibration | None = None
     visible_observations: list[Observation] = field(default_factory=list)
     sealed_outputs: list[StateEstimate] = field(default_factory=list)
-    rejected_observations: dict[tuple[str, int], str] = field(default_factory=dict)
+    rejected_observations: dict[ObservationKey, str] = field(default_factory=dict)
     staged_calibration: DelayCalibration | None = None
     staged_sensor: str | None = None
 
@@ -45,6 +53,9 @@ class ObservationDecision:
     arrival_time: float | None
     baseline_corrected_time: float
     corrected_time: float
+    corrected_time_min: float
+    corrected_time_max: float
+    clock_segment: str | None
     time_shift: float
     classification: str
     reason: str
@@ -77,13 +88,16 @@ class DelayComparison:
 
 @dataclass(frozen=True, slots=True)
 class TimelinePosition:
-    identity: tuple[str, int]
+    identity: ObservationKey
     sensor: str
     sequence: int
     stamp: float
     arrival_time: float | None
     baseline_time: float
     candidate_time: float
+    candidate_time_min: float
+    candidate_time_max: float
+    clock_segment: str | None
     time_shift: float
     baseline_order: int
     candidate_order: int
@@ -94,7 +108,7 @@ class TimelinePosition:
 
 @dataclass(frozen=True, slots=True)
 class TimelinePositionChange:
-    identity: tuple[str, int]
+    identity: ObservationKey
     baseline_time: float
     candidate_time: float
     baseline_x: float | None = None
@@ -152,7 +166,7 @@ class LocalizationPipeline:
         self.seal_time: float | None = None
         self.sealed_outputs: list[StateEstimate] = []
         self.outputs: list[StateEstimate] = []
-        self.rejected_observations: dict[tuple[str, int], str] = {}
+        self.rejected_observations: dict[ObservationKey, str] = {}
         self.staged_calibration: DelayCalibration | None = None
         self.staged_comparison: DelayComparison | None = None
         self.staged_sensor: str | None = None
@@ -167,7 +181,7 @@ class LocalizationPipeline:
                 self.seal_time is not None
                 and self.calibration.corrected_time(observation) <= self.seal_time + 1e-9
             ):
-                key = (observation.sensor, observation.sequence)
+                key = observation.identity()
                 self.rejected_observations.setdefault(
                     key,
                     "观测在封存边界之后到达，但按当前延迟校正到边界之前，不能改写封存历史",
@@ -276,6 +290,29 @@ class LocalizationPipeline:
     def stage_clock_model(self, model: SensorClockModel) -> DelayComparison:
         return self._stage_calibration(model.sensor, self.calibration.with_clock(model))
 
+    def stage_segmented_clock(
+        self, model: SegmentedSensorClock
+    ) -> DelayComparison:
+        candidate = self.calibration.with_segmented_clock(model)
+        return self._stage_calibration(model.sensor, candidate)
+
+    def stage_clock_segment(
+        self,
+        sensor: str,
+        segment: "ClockSegment",
+        boundaries: tuple["RebootBoundary", ...] = (),
+    ) -> DelayComparison:
+        current = self.calibration.clock_for(sensor)
+        if isinstance(current, SegmentedSensorClock):
+            model = current.with_segment(segment)
+            if boundaries:
+                model = SegmentedSensorClock(
+                    sensor, model.segments, boundaries, model.fallback
+                )
+        else:
+            model = SegmentedSensorClock(sensor, (segment,), boundaries, current)
+        return self.stage_segmented_clock(model)
+
     def _stage_calibration(
         self, sensor: str, candidate: DelayCalibration
     ) -> DelayComparison:
@@ -303,7 +340,7 @@ class LocalizationPipeline:
         self.calibration = self.staged_calibration
         for decision in comparison.decisions:
             if decision.classification == "crossing_rejected":
-                self.rejected_observations[(decision.sensor, decision.sequence)] = decision.reason
+                self.rejected_observations[(decision.sensor, decision.clock_segment, decision.sequence)] = decision.reason
         staged_sensor = comparison.sensor
         self.discard_staged_delay()
         self._restore_anchor_and_rebuild()
@@ -510,6 +547,7 @@ class LocalizationPipeline:
         return (
             calibration.corrected_time(observation),
             observation.sensor,
+            "" if observation.clock_segment is None else str(observation.clock_segment),
             observation.sequence,
         )
 
@@ -599,6 +637,16 @@ class LocalizationPipeline:
     ) -> ObservationDecision:
         old_time = baseline.corrected_time(observation)
         new_time = candidate.corrected_time(observation)
+        new_bounds = candidate.corrected_time_bounds(observation)
+        candidate_clock = candidate.clock_for(observation.sensor)
+        clock_segment = observation.clock_segment
+        if isinstance(candidate_clock, SegmentedSensorClock):
+            try:
+                clock_segment = candidate_clock.segment_for(
+                    observation.time, observation.sequence, observation.clock_segment
+                ).segment_id
+            except ValueError:
+                clock_segment = observation.clock_segment
         boundary = self.seal_time
         if boundary is None:
             classification = "open_recomputed"
@@ -615,6 +663,8 @@ class LocalizationPipeline:
         else:
             classification = "open_adopted"
             reason = "候选延迟把观测移到封存边界之后，从封存边界状态开始参与开放重算"
+        if new_bounds[1] - new_bounds[0] > 1e-9:
+            reason += f"；该段校时只能确定轨迹时间范围 [{new_bounds[0]:.3f}, {new_bounds[1]:.3f}]"
         time_shift = old_time - new_time
         return ObservationDecision(
             observation.sensor,
@@ -623,6 +673,9 @@ class LocalizationPipeline:
             observation.arrival_time,
             old_time,
             new_time,
+            new_bounds[0],
+            new_bounds[1],
+            clock_segment,
             time_shift,
             classification,
             reason,
@@ -668,26 +721,39 @@ class LocalizationPipeline:
         candidate: DelayCalibration,
         decisions: tuple[ObservationDecision, ...],
     ) -> tuple[tuple[TimelinePosition, ...], tuple[TimelinePositionChange, ...]]:
-        affected_keys = {(item.sensor, item.sequence) for item in affected}
-        decision_by_key = {(item.sensor, item.sequence): item for item in decisions}
+        affected_keys = {item.identity() for item in affected}
+        decision_by_key = {
+            (item.sensor, item.clock_segment, item.sequence): item
+            for item in decisions
+        }
         baseline_events = self._eligible_with(self.arrival_horizon, baseline)
         candidate_events = self._eligible_with(self.arrival_horizon, candidate)
         baseline_states = self._simulate_event_states(baseline_events, baseline)
         candidate_states = self._simulate_event_states(candidate_events, candidate)
         baseline_order = {
-            (item.sensor, item.sequence): index
+            item.identity(): index
             for index, item in enumerate(baseline_events)
         }
         candidate_order = {
-            (item.sensor, item.sequence): index
+            item.identity(): index
             for index, item in enumerate(candidate_events)
         }
         timeline: list[TimelinePosition] = []
         position_changes: list[TimelinePositionChange] = []
-        for observation in sorted(visible, key=lambda item: (item.sensor, item.sequence)):
-            key = (observation.sensor, observation.sequence)
+        for observation in sorted(visible, key=lambda item: item.identity()):
+            key = observation.identity()
             old_time = baseline.corrected_time(observation)
             new_time = candidate.corrected_time(observation)
+            candidate_bounds = candidate.corrected_time_bounds(observation)
+            candidate_clock = candidate.clock_for(observation.sensor)
+            clock_segment = observation.clock_segment
+            if isinstance(candidate_clock, SegmentedSensorClock):
+                try:
+                    clock_segment = candidate_clock.segment_for(
+                        observation.time, observation.sequence, observation.clock_segment
+                    ).segment_id
+                except ValueError:
+                    clock_segment = observation.clock_segment
             decision = decision_by_key.get(key)
             if decision is not None:
                 classification = decision.classification
@@ -709,6 +775,9 @@ class LocalizationPipeline:
                     observation.arrival_time,
                     old_time,
                     new_time,
+                    candidate_bounds[0],
+                    candidate_bounds[1],
+                    clock_segment,
                     old_time - new_time,
                     -1 if old_order is None else old_order,
                     -1 if new_order is None else new_order,
@@ -735,14 +804,14 @@ class LocalizationPipeline:
 
     def _simulate_event_states(
         self, events: list[Observation], calibration: DelayCalibration
-    ) -> dict[tuple[str, int], StateEstimate]:
+    ) -> dict[ObservationKey, StateEstimate]:
         estimator = LocalizationEstimator()
         if self.sealed_outputs:
             estimator.restore(self.sealed_outputs[-1])
-        states: dict[tuple[str, int], StateEstimate] = {}
+        states: dict[ObservationKey, StateEstimate] = {}
         for observation in events:
             estimator.step(self._retime_with(observation, calibration))
-            states[(observation.sensor, observation.sequence)] = estimator.snapshot()
+            states[observation.identity()] = estimator.snapshot()
         return states
 
     def _open_gaps(self, calibration: DelayCalibration) -> tuple[UncertainInterval, ...]:

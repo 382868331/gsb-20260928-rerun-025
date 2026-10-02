@@ -25,9 +25,13 @@ python -m robot_localization.cli --output-dir outputs
 
 `seal_until(t)` 之前的输出是封存历史，数值不再变化。校时先用 `stage_sensor_clock(sensor, anchors=...)`（固定延迟仍可用 `stage_sensor_delay`）生成 `DelayComparison`：两套解释并排列出每条 `(sensor, sequence)` 观测的原始戳记、到达时间、原校正时间、候选校正时间、时间移动量及全局顺序变化。确认后调用 `publish_staged_delay()`，系统从封存边界状态恢复估计器，只因果重放开放区间；调用 `discard_staged_delay()` 可撤销尚未发布的校正，轨迹、已封存输出和观测原始 `time` 均保持不变。
 
-校时只改变观测在轨迹时间轴上的位置，不改变 `(sensor, sequence)` 身份。不同来源在候选时间下同刻时，按 `(corrected_time, sensor, sequence)` 稳定应用；交换先后时也按新顺序各应用一次，不会因为序号或到达时间变化而重复应用、丢弃或合并观测。`position_changes` 保留每个身份在原解释和候选解释下的对应状态位置，`timeline` 明确哪些移动来自校时、哪些仅顺序受其他观测影响。
+校时只改变观测在轨迹时间轴上的位置，不改变观测身份。不同来源在候选时间下同刻时，按 `(corrected_time, sensor, clock_segment, sequence)` 稳定应用；交换先后时也按新顺序各应用一次，不会因为序号、重启段或到达时间变化而重复应用、丢弃或合并观测。`position_changes` 保留每个身份在原解释和候选解释下的对应状态位置，`timeline` 明确哪些移动来自校时、哪些仅顺序受其他观测影响。
 
 开放区间重估后，`uncertain_intervals` 列出仍然超过传感器超时阈值的空窗及原因；这些位置变化来自缺少观测后的预测，而不是校时本身。
+
+设备重启后的归零时钟不能并入一条连续漂移曲线。`ClockSegment` 表示一次未中断采集段，`SegmentedSensorClock` 为同一传感器保存多段独立锚点；观测可用仅用于身份区分的 `clock_segment` 标记，原 `time`、`(sensor, sequence)` 数据和历史解释都不改写。即使不同段的原始戳记和序号相同，也会按 `(sensor, clock_segment, sequence)` 分成不同观测。`RebootBoundary` 可记录明确边界或 `after_sequence_min/after_sequence_max` 推测范围，边界方案本身可作为不同候选比较。
+
+每段至少有两个精确锚点时，只在锚点覆盖区间内给出分段线性的缓慢漂移；只有一个可靠锚点、锚点本身有范围、或外推超出可靠区间时，`ClockAnchor.corrected_time_min/max` 与 `ClockSegment.time_bounds_at()` 保留轨迹时间范围，不会补出精确时刻。逐段调用 `stage_clock_segment()` 可只暂存该段，发布后再暂存另一段；撤回未确认段不会移除已发布段，也不会把前一段的偏移、漂移率或锚点默认沿用到重启之后。
 
 观测跨越封存边界时逐条给出原因：旧、新校正时间都在边界后的观测参与开放重算；都在边界前的观测属于不可修改历史；候选校时会把开放观测移入封存区间时拒绝该观测并记录原因，而不是回写旧位置；候选校时把封存观测移到边界后时，则从同一个封存锚点开始纳入开放重算。封存之后才到达、却校正到边界之前的迟到消息同样只记录拒用原因，不进入融合。
 

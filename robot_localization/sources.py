@@ -187,3 +187,83 @@ class SyntheticScenarioSource:
 
 def _normalize_angle(angle: float) -> float:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+class RebootScenarioSource:
+    """Deterministic stream with slow drift, two clock resets and late data.
+
+    One sensor resets its clock to zero twice mid-recording.  Sequence numbers
+    stay globally unique, while raw stamps repeat; observations therefore keep
+    their identity and every reboot segment needs its own calibration.
+    """
+
+    # (trajectory time of reset, sequence index of the last pre-reset sample).
+    REBOOTS = ((4.0, 20), (8.0, 40))
+    RESET_LOCAL_DELAY = (0.05, 0.05)
+    DRIFT_PER_SECOND = -0.02
+    LATE_SEQUENCE = 25
+
+    def __init__(self, sensor: str = "rear_wheels", period: float = 0.2) -> None:
+        self.sensor = sensor
+        self.period = period
+
+    def _segment_offset(self, segment: int) -> float:
+        offset = 0.10
+        if segment >= 1:
+            offset = self.RESET_LOCAL_DELAY[0]
+        if segment >= 2:
+            offset = self.RESET_LOCAL_DELAY[1]
+        return offset
+
+    def stamp_for(self, trajectory_time: float, segment: int) -> float:
+        origin = (0.0, 4.0, 8.0)[segment]
+        local = trajectory_time - origin
+        return local + self._segment_offset(segment) + self.DRIFT_PER_SECOND * local
+
+    def anchors(self) -> dict[int, list[tuple[float, float]]]:
+        points = {}
+        for segment, (start, end) in enumerate(((0.0, 4.0), (0.0, 4.0), (0.0, 2.0))):
+            origin = (0.0, 4.0, 8.0)[segment]
+            points[segment] = [
+                (self.stamp_for(origin + start, segment), origin + start),
+                (self.stamp_for(origin + end, segment), origin + end),
+            ]
+        return points
+
+    def boundaries(self) -> list[tuple[int, bool, tuple[float, float]]]:
+        return [
+            (self.REBOOTS[0][1], True, (self.REBOOTS[0][0], self.REBOOTS[0][0])),
+            (self.REBOOTS[1][1], False, (7.7, 8.3)),
+        ]
+
+    def observations(self) -> list[WheelObservation]:
+        observations: list[WheelObservation]
+        observations = []
+        sequence = 0
+        for trajectory_time_int in range(0, 51):
+            trajectory_time = trajectory_time_int * self.period
+            segment = 0
+            for reboot_time, cut in self.REBOOTS:
+                if trajectory_time > reboot_time + 1e-9 and sequence > cut:
+                    segment += 1
+            stamp = self.stamp_for(trajectory_time, segment)
+            # Wall-clock arrival keeps global time even though the device
+            # stamp resets to zero; the corrected trajectory time never arrives
+            # after its own reception wall clock.
+            arrival = trajectory_time + 0.10
+            if sequence == self.LATE_SEQUENCE:
+                # Segment 1 sample held back and delivered late.
+                arrival = 9.5
+            observations.append(
+                WheelObservation(
+                    time=stamp,
+                    sensor=self.sensor,
+                    sequence=sequence,
+                    arrival_time=arrival,
+                    linear_velocity=1.0,
+                    yaw_rate=0.0,
+                )
+            )
+            sequence += 1
+        observations.sort(key=lambda item: item.observed_at())
+        return observations

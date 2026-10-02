@@ -35,6 +35,18 @@ python -m robot_localization.cli --output-dir outputs
 
 轮速断流、IMU 断流和疑似打滑都会写入 `degraded_reasons`。断流期间协方差继续增长，因此误差范围会扩大，不会声称精度保持不变。
 
+## 设备重启与分段校时
+
+设备在采集途中重启会把设备钟重新置零，同一原始时间戳会在不同采集段重复出现。系统以 `(sensor, sequence)` 作为观测身份，并以重启边界之间的序号划分采集段（`segments.py`）：相同原始戳记落在不同段时，经各自段的锚点映射到不同轨迹时间，绝不会被当成同一次观测。
+
+- `stage_reboot_segments(sensor, boundaries=..., anchors=...)` 并排比较整套“重启边界 + 各段校时”解释；`RebootBoundary(after_sequence, confirmed, reset_window)` 可表示明确重启记录，也可只给出轨迹时间上的推测窗口而不伪造精确重启时刻。
+- 每段使用自己的 `SegmentAnchor(stamp, corrected_time, uncertainty)`。只有一个可靠锚点时状态标记为 `single_anchor`；跨段锚点范围矛盾时给出 `reboot_contradictions` 并保留各自范围，`DelayComparison.segment_views` 逐段列出依据、序号、戳记区间、校正时间区间和不能确定的原因。
+- `stage_reboot_segment()` / `confirm_reboot_segment()` 只修改指定段；确认后仅在仍开放且受影响的区间重估，撤回另一段未确认草稿不会撤销早先的确认。未校时段保持身份映射并标记 `uncalibrated`，不会把上一段或上一次重启前的校时参数静默沿用过去。
+- 段间交错、同刻与跨过封存边界的观测沿用逐条 `ObservationDecision`（参与开放重算、封存不变、拒绝移入封存、重新纳入开放），`TimelinePosition` 增加 `segment_index`；观测的原始 `time`、身份和历史解释均不改写，迟到观测按校正后的段内轨迹时间因果重放。
+- 分段模型（`type: reboot_segments`、各段锚点、边界确认状态与推测窗口）随检查点保存；恢复后继续同一套解释方案，可继续比较、逐段确认或撤回。
+
+`RebootScenarioSource` 生成含缓慢漂移、两次归零和迟到观测的记录；`tests/test_reboot_segments.py` 覆盖同戳不同段、单锚点/推测窗口范围、跨段矛盾、交错与迟到排序、封存逐条决策、方案比较、逐段确认互不影响以及保存恢复。
+
 默认示例同时运行零延迟（未校正）基线与时钟校正运行，`metrics.json` 输出两者的位置 RMSE、95% 半径覆盖率、已发布重算记录、两套时钟解释的逐身份并排比较、未发布校时的撤销记录、开放区间不确定空窗以及恢复前后的可见边界；`trajectory.csv` 增加 `raw_position_error` 与 `sealed` 列。
 
 ## 测试

@@ -5,6 +5,8 @@ from typing import Iterable
 
 from .types import Observation
 
+REBOOT_CLOCK_TYPE = "reboot_segments"
+
 
 @dataclass(frozen=True, slots=True)
 class ClockAnchor:
@@ -124,6 +126,8 @@ class DelayCalibration:
     ) -> None:
         self._models: dict[str, SensorClockModel] = {}
         for sensor, model in (models or {}).items():
+            if isinstance(model, dict) and model.get("type") == REBOOT_CLOCK_TYPE:
+                continue
             if isinstance(model, SensorClockModel):
                 clock = SensorClockModel(sensor, model.anchors)
             elif isinstance(model, SensorDelayModel):
@@ -133,6 +137,12 @@ class DelayCalibration:
             else:
                 clock = self._model_from_dict(sensor, model)
             self._models[sensor] = clock
+
+        self._reboot_models: dict[str, "object"] = {}
+        for sensor, model in (models or {}).items():
+            reboot_clock = self._reboot_from_dict_or_value(sensor, model)
+            if reboot_clock is not None:
+                self._reboot_models[sensor] = reboot_clock
 
     @staticmethod
     def _model_from_dict(sensor: str, payload: dict[str, object]) -> SensorClockModel:
@@ -153,6 +163,52 @@ class DelayCalibration:
         ]
         return SensorClockModel.from_points(sensor, points)
 
+    @staticmethod
+    def _reboot_from_dict_or_value(sensor: str, model: object):
+        from .segments import (
+            RebootBoundary,
+            SegmentAnchor,
+            SegmentClock,
+            SegmentedSensorClock,
+        )
+
+        if isinstance(model, SegmentedSensorClock):
+            return SegmentedSensorClock(sensor, model.segments, model.boundaries)
+        if isinstance(model, dict) and model.get("type") == REBOOT_CLOCK_TYPE:
+            return SegmentedSensorClock(
+                sensor,
+                tuple(
+                    SegmentClock(
+                        int(item["index"]),
+                        tuple(
+                            SegmentAnchor(
+                                float(anchor["stamp"]),
+                                float(anchor["corrected_time"]),
+                                float(anchor.get("uncertainty", 0.0)),
+                            )
+                            for anchor in item.get("anchors", [])
+                        ),
+                    )
+                    for item in model.get("segments", [])
+                ),
+                tuple(
+                    RebootBoundary(
+                        int(item["after_sequence"]),
+                        bool(item.get("confirmed", True)),
+                        (
+                            None
+                            if item.get("reset_window") is None
+                            else (
+                                float(item["reset_window"][0]),
+                                float(item["reset_window"][1]),
+                            )
+                        ),
+                    )
+                    for item in model.get("boundaries", [])
+                ),
+            )
+        return None
+
     def clock_for(self, sensor: str) -> SensorClockModel:
         return self._models.get(sensor, SensorClockModel(sensor))
 
@@ -166,7 +222,27 @@ class DelayCalibration:
         return self.clock_for(sensor).offset_at(stamp)
 
     def corrected_time(self, observation: Observation) -> float:
+        reboot = self._reboot_models.get(observation.sensor)
+        if reboot is not None:
+            return reboot.corrected_time_at(observation.sequence, observation.time)
         return self.clock_for(observation.sensor).corrected_time_at(observation.time)
+
+    def corrected_range(self, observation: Observation) -> tuple[float, float]:
+        """Reliable corrected-time interval; wider than a point when anchors are weak."""
+        reboot = self._reboot_models.get(observation.sensor)
+        if reboot is not None:
+            return reboot.corrected_range(observation.sequence, observation.time)
+        point = self.corrected_time(observation)
+        return point, point
+
+    def reboot_clock_for(self, sensor: str):
+        return self._reboot_models.get(sensor)
+
+    def segment_index_for(self, observation: Observation) -> int | None:
+        reboot = self._reboot_models.get(observation.sensor)
+        if reboot is None:
+            return None
+        return reboot.segment_index_for(observation.sequence)
 
     def with_delay(self, sensor: str, delay: float) -> "DelayCalibration":
         return self.with_clock(SensorClockModel.fixed(sensor, float(delay)))
@@ -189,7 +265,47 @@ class DelayCalibration:
         clone = DelayCalibration()
         clone._models = dict(self._models)
         clone._models[model.sensor] = model
+        clone._reboot_models = dict(self._reboot_models)
+        clone._reboot_models.pop(model.sensor, None)
         return clone
+
+    def with_reboot_clock(self, model) -> "DelayCalibration":
+        """Attach independent per-reboot-segment explanations for one sensor."""
+        clone = DelayCalibration()
+        clone._models = dict(self._models)
+        clone._reboot_models = dict(self._reboot_models)
+        clone._reboot_models[model.sensor] = model
+        clone._models.pop(model.sensor, None)
+        return clone
+
+    def with_reboot_segment(
+        self, model, segment_index: int, anchors, boundary=None
+    ) -> "DelayCalibration":
+        """Update one segment (and optionally one boundary) without touching others."""
+        from .segments import SegmentClock, SegmentAnchor, _parse_boundary
+
+        updates = {
+            segment_index: (
+                anchors
+                if isinstance(anchors, SegmentClock)
+                else SegmentClock(
+                    segment_index,
+                    tuple(
+                        anchor
+                        if isinstance(anchor, SegmentAnchor)
+                        else SegmentAnchor(*(float(value) for value in anchor))
+                        for anchor in anchors
+                    ),
+                )
+            )
+        }
+        boundary_updates = None
+        if boundary is not None:
+            parsed = _parse_boundary(boundary)
+            boundary_updates = {segment_index - 1: parsed}
+        return self.with_reboot_clock(
+            model.replacing(updates, boundary_updates)
+        )
 
     def affected_interval(
         self, sensor: str, observations: list[Observation]
@@ -200,4 +316,11 @@ class DelayCalibration:
         return min(times), max(times)
 
     def as_dict(self) -> dict[str, object]:
-        return {sensor: model.as_dict() for sensor, model in self._models.items()}
+        result = {sensor: model.as_dict() for sensor, model in self._models.items()}
+        result.update(
+            {
+                sensor: model.as_dict()
+                for sensor, model in self._reboot_models.items()
+            }
+        )
+        return result

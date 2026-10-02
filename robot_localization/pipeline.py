@@ -4,6 +4,10 @@ from dataclasses import dataclass, field, fields
 
 from .calibration import DelayCalibration, SensorClockModel
 from .estimator import LocalizationEstimator, StateEstimate
+from .segments import (
+    RebootBoundary,
+    SegmentedSensorClock,
+)
 from .types import Observation
 
 
@@ -48,6 +52,25 @@ class ObservationDecision:
     time_shift: float
     classification: str
     reason: str
+    segment_index: int | None = None
+    baseline_range: tuple[float, float] | None = None
+    candidate_range: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentView:
+    """Per-reboot-segment summary inside a staged clock explanation."""
+
+    index: int
+    sequences: tuple[int, ...]
+    stamp_span: tuple[float, float] | None
+    corrected_span: tuple[float, float] | None
+    anchor_count: int
+    single_anchor: bool
+    confirmed_boundary_before: bool
+    reset_window: tuple[float, float] | None
+    status: str
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +96,8 @@ class DelayComparison:
     timeline: tuple["TimelinePosition", ...]
     position_changes: tuple["TimelinePositionChange", ...]
     uncertain_intervals: tuple["UncertainInterval", ...]
+    segment_views: tuple[SegmentView, ...] = ()
+    reboot_contradictions: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +115,7 @@ class TimelinePosition:
     order_delta: int
     classification: str
     reason: str
+    segment_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +302,66 @@ class LocalizationPipeline:
     def stage_clock_model(self, model: SensorClockModel) -> DelayComparison:
         return self._stage_calibration(model.sensor, self.calibration.with_clock(model))
 
+    def stage_reboot_segments(
+        self,
+        sensor: str,
+        *,
+        boundaries: list[RebootBoundary | tuple | dict],
+        anchors: dict[int, list[tuple]] | None = None,
+    ) -> DelayComparison:
+        """Stage a complete multi-reboot explanation for comparison.
+
+        Every segment starts with its own anchors; nothing is inherited from
+        a pre-reboot clock.  The candidate is not published until confirmed.
+        """
+
+        model = SegmentedSensorClock.from_anchors(
+            sensor, (anchors or {}).items(), boundaries
+        )
+        return self._stage_calibration(
+            sensor, self.calibration.with_reboot_clock(model)
+        )
+
+    def stage_reboot_segment(
+        self,
+        sensor: str,
+        segment_index: int,
+        anchors: list[tuple],
+        *,
+        boundary: RebootBoundary | tuple | dict | None = None,
+    ) -> DelayComparison:
+        """Stage an explanation for one acquisition segment only.
+
+        Other confirmed segments remain exactly as they were.  Withdrawing an
+        unconfirmed segment therefore never undoes an earlier confirmation.
+        """
+
+        model = self.calibration.reboot_clock_for(sensor)
+        if model is None:
+            raise ValueError(
+                f"sensor {sensor!r} has no reboot segments; stage boundaries first"
+            )
+        if not 0 <= segment_index < len(model.segments):
+            raise ValueError(f"unknown reboot segment {segment_index}")
+        candidate = self.calibration.with_reboot_segment(
+            model, segment_index, anchors, boundary
+        )
+        return self._stage_calibration(sensor, candidate)
+
+    def confirm_reboot_segment(
+        self,
+        sensor: str,
+        segment_index: int,
+        anchors: list[tuple],
+        *,
+        boundary: RebootBoundary | tuple | dict | None = None,
+    ) -> RecomputeReport:
+        """Publish one segment; only its still-open affected interval re-estimates."""
+        self.stage_reboot_segment(
+            sensor, segment_index, anchors, boundary=boundary
+        )
+        return self.publish_staged_delay()
+
     def _stage_calibration(
         self, sensor: str, candidate: DelayCalibration
     ) -> DelayComparison:
@@ -371,6 +457,11 @@ class LocalizationPipeline:
             visible, affected, baseline, candidate, decisions
         )
         uncertain_intervals = self._open_gaps(candidate)
+        segment_views = self._segment_views(sensor, affected, candidate)
+        candidate_reboot = candidate.reboot_clock_for(sensor)
+        contradictions = (
+            candidate_reboot.contradictions() if candidate_reboot is not None else ()
+        )
         return DelayComparison(
             sensor,
             baseline_view,
@@ -382,6 +473,8 @@ class LocalizationPipeline:
             timeline,
             position_changes,
             uncertain_intervals,
+            segment_views,
+            contradictions,
         )
 
     # ------------------------------------------------------------- inspection
@@ -616,6 +709,9 @@ class LocalizationPipeline:
             classification = "open_adopted"
             reason = "候选延迟把观测移到封存边界之后，从封存边界状态开始参与开放重算"
         time_shift = old_time - new_time
+        segment_index = candidate.segment_index_for(observation)
+        baseline_range = baseline.corrected_range(observation)
+        candidate_range = candidate.corrected_range(observation)
         return ObservationDecision(
             observation.sensor,
             observation.sequence,
@@ -626,6 +722,9 @@ class LocalizationPipeline:
             time_shift,
             classification,
             reason,
+            segment_index,
+            baseline_range,
+            candidate_range,
         )
 
     def _setting_view(
@@ -715,6 +814,7 @@ class LocalizationPipeline:
                     0 if old_order is None or new_order is None else new_order - old_order,
                     classification,
                     reason,
+                    candidate.segment_index_for(observation),
                 )
             )
             if key in affected_keys:
@@ -774,6 +874,69 @@ class LocalizationPipeline:
                         )
                     )
         return tuple(gaps)
+
+    def _segment_views(
+        self,
+        sensor: str,
+        affected: list[Observation],
+        calibration: DelayCalibration,
+    ) -> tuple[SegmentView, ...]:
+        model = calibration.reboot_clock_for(sensor)
+        if model is None:
+            return ()
+        contradiction_pairs = {
+            tuple(item["between_segments"]) for item in model.contradictions()
+        }
+        views: list[SegmentView] = []
+        for segment in model.segments:
+            items = [
+                item
+                for item in affected
+                if model.segment_index_for(item.sequence) == segment.index
+            ]
+            sequences = tuple(item.sequence for item in items)
+            stamp_span = (
+                (min(item.time for item in items), max(item.time for item in items))
+                if items
+                else None
+            )
+            lows = [calibration.corrected_range(item)[0] for item in items]
+            highs = [calibration.corrected_range(item)[1] for item in items]
+            corrected_span = (min(lows), max(highs)) if items else None
+            boundary = model.boundary_after_segment(segment.index - 1)
+            if not segment.calibrated:
+                status = "uncalibrated"
+                reason = "该重启段尚无独立锚点，位置只能作为未知范围保留，不沿用前段参数"
+            elif segment.single_anchor:
+                status = "single_anchor"
+                reason = "仅有一个可靠锚点：只能确定固定偏移，漂移与重启位置仍保留范围"
+            elif (segment.index, segment.index + 1) in contradiction_pairs or (
+                segment.index - 1,
+                segment.index,
+            ) in contradiction_pairs:
+                status = "anchor_conflict"
+                reason = "与相邻重启段的锚点范围互相矛盾，保留范围而不强行拼接"
+            elif boundary is not None and boundary.reset_window is not None:
+                status = "boundary_uncertain"
+                reason = "重启位置只在推测窗口内确认，段内校时随边界窗口保留不确定性"
+            else:
+                status = "calibrated"
+                reason = "该段具有独立校时依据"
+            views.append(
+                SegmentView(
+                    segment.index,
+                    sequences,
+                    stamp_span,
+                    corrected_span,
+                    len(segment.anchors),
+                    segment.single_anchor,
+                    boundary.confirmed if boundary is not None else True,
+                    None if boundary is None else boundary.reset_window,
+                    status,
+                    reason,
+                )
+            )
+        return tuple(views)
 
     def _trim_checkpoints(self) -> None:
         if self.sealed_outputs:

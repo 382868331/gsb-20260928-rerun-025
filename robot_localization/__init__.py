@@ -14,6 +14,12 @@ from .pipeline import (
     UncertainInterval,
 )
 from .recording import CheckpointStore, JsonlMessageSource, JsonlRecorder
+from .segments import (
+    RebootBoundary,
+    SegmentAnchor,
+    SegmentClock,
+    SegmentedSensorClock,
+)
 from .sources import SyntheticScenarioSource
 from .types import ImuObservation, Observation, WheelObservation
 
@@ -40,4 +46,8 @@ __all__ = [
     "TimelinePosition",
     "TimelinePositionChange",
     "UncertainInterval",
+    "RebootBoundary",
+    "SegmentAnchor",
+    "SegmentClock",
+    "SegmentedSensorClock",
 ]

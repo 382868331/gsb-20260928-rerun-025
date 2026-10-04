@@ -48,6 +48,8 @@ class CheckpointStore:
         rejected_observations: dict[tuple[str, int], str] | None = None,
         staged_calibration: dict[str, object] | None = None,
         staged_sensor: str | None = None,
+        anchor_records: list | None = None,
+        pending_interpretations: list | None = None,
     ) -> None:
         payload = {
             "time": estimate.time,
@@ -73,6 +75,14 @@ class CheckpointStore:
             "fixed_delays": _legacy_fixed_delays(calibration or {}),
             "staged_calibration": staged_calibration,
             "staged_sensor": staged_sensor,
+            "anchor_records": [
+                item.as_dict() if hasattr(item, "as_dict") else item
+                for item in (anchor_records or [])
+            ],
+            "pending_interpretations": [
+                item.as_dict() if hasattr(item, "as_dict") else item
+                for item in (pending_interpretations or [])
+            ],
             "sealed_outputs": [
                 serialize_state(item)
                 for item in (sealed_outputs or [])
@@ -125,6 +135,8 @@ class CheckpointStore:
             },
             "staged_calibration": payload.get("staged_calibration"),
             "staged_sensor": payload.get("staged_sensor"),
+            "anchor_records": payload.get("anchor_records", []),
+            "pending_interpretations": payload.get("pending_interpretations", []),
         }
         return estimate, observations, metadata
 

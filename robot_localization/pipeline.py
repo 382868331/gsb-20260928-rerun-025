@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
+from dataclasses import replace
 
 from .calibration import DelayCalibration, SensorClockModel
 from .estimator import LocalizationEstimator, StateEstimate
+from .interpretations import AnchorRecord, AnchorRetraction, Interpretation
 from .segments import (
+    PartialAdoptionClock,
     RebootBoundary,
+    SegmentAnchor,
+    SegmentClock,
     SegmentedSensorClock,
 )
 from .types import Observation
@@ -23,6 +28,10 @@ class Checkpoint:
     rejected_observations: dict[tuple[str, int], str] = field(default_factory=dict)
     staged_calibration: DelayCalibration | None = None
     staged_sensor: str | None = None
+    anchor_records: list = field(default_factory=list)
+    pending_interpretations: list = field(default_factory=list)
+    anchor_records: list = field(default_factory=list)
+    pending_interpretations: list = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +107,19 @@ class DelayComparison:
     uncertain_intervals: tuple["UncertainInterval", ...]
     segment_views: tuple[SegmentView, ...] = ()
     reboot_contradictions: tuple[dict[str, object], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class InterpretationComparisonEntry:
+    """One registered candidate explanation next to its live comparison."""
+
+    name: str
+    sensor: str
+    status: str
+    note: str
+    anchor_ids: tuple[str, ...]
+    adopted_sequences: tuple[int, ...] | None
+    comparison: DelayComparison
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +204,9 @@ class LocalizationPipeline:
         self.staged_calibration: DelayCalibration | None = None
         self.staged_comparison: DelayComparison | None = None
         self.staged_sensor: str | None = None
+        self.anchor_records: dict[str, AnchorRecord] = {}
+        self.interpretations: dict[str, Interpretation] = {}
+        self.interpretation_comparisons: dict[str, DelayComparison] = {}
 
     # ------------------------------------------------------------------ ingest
 
@@ -227,6 +252,8 @@ class LocalizationPipeline:
                 dict(self.rejected_observations),
                 self.staged_calibration,
                 self.staged_sensor,
+                list(self.anchor_records.values()),
+                list(self.interpretations.values()),
             )
         )
         return list(self.outputs)
@@ -275,6 +302,8 @@ class LocalizationPipeline:
                 dict(self.rejected_observations),
                 self.staged_calibration,
                 self.staged_sensor,
+                list(self.anchor_records.values()),
+                list(self.interpretations.values()),
             )
         )
         return list(self.sealed_outputs)
@@ -477,6 +506,250 @@ class LocalizationPipeline:
             contradictions,
         )
 
+    # ------------------------------------------- interpretation registry
+
+    def register_anchor(
+        self,
+        anchor_id: str,
+        sensor: str,
+        segment_index: int,
+        anchor,
+        *,
+        arrival_time: float | None = None,
+        applies_to: tuple[int, int] | None = None,
+    ) -> AnchorRecord:
+        """Register an anchor with provenance; never changes the live clock."""
+        if anchor_id in self.anchor_records:
+            raise ValueError(f"anchor {anchor_id!r} is already registered")
+        parsed = (
+            anchor
+            if isinstance(anchor, SegmentAnchor)
+            else SegmentAnchor(*(float(value) for value in anchor))
+        )
+        record = AnchorRecord(
+            anchor_id,
+            sensor,
+            segment_index,
+            parsed,
+            arrival_time,
+            None if applies_to is None else (int(applies_to[0]), int(applies_to[1])),
+        )
+        self.anchor_records[anchor_id] = record
+        return record
+
+    def register_interpretation(
+        self,
+        name: str,
+        sensor: str,
+        *,
+        boundaries: list,
+        anchors: dict[int, list] | None = None,
+        anchor_ids: tuple[str, ...] = (),
+        applies_to: tuple[int, int] | None = None,
+        note: str = "",
+    ) -> DelayComparison:
+        """Register one boundary/drift explanation and compare it openly.
+
+        The candidate is only stored for comparison; the live calibration
+        and every previously registered candidate stay untouched, so the
+        newest registration never auto-overrides anything.
+        """
+        model = SegmentedSensorClock.from_anchors(
+            sensor, (anchors or {}).items(), boundaries
+        )
+        return self._register_interpretation(
+            name,
+            sensor,
+            model,
+            anchor_ids=anchor_ids,
+            applies_to=applies_to,
+            note=note,
+        )
+
+    def register_late_anchor(
+        self,
+        anchor_id: str,
+        sensor: str,
+        segment_index: int,
+        anchor,
+        *,
+        applies_to: tuple[int, int],
+        arrival_time: float | None = None,
+        name: str | None = None,
+        note: str = "",
+    ) -> DelayComparison:
+        """Add a late anchor as a partial-adoption interpretation.
+
+        Only observations whose sequence falls inside ``applies_to`` follow
+        the new explanation; every other observation keeps its original
+        version.  Raw stamps (including duplicates across a reset) and
+        identities are unchanged.
+        """
+        self.register_anchor(
+            anchor_id,
+            sensor,
+            segment_index,
+            anchor,
+            arrival_time=arrival_time,
+            applies_to=applies_to,
+        )
+        model = self.calibration.reboot_clock_for(sensor)
+        if isinstance(model, PartialAdoptionClock):
+            model = model.candidate
+        if model is None:
+            raise ValueError(
+                f"sensor {sensor!r} has no reboot segments to attach a late anchor to"
+            )
+        if not 0 <= segment_index < len(model.segments):
+            raise ValueError(f"unknown reboot segment {segment_index}")
+        parsed = (
+            anchor
+            if isinstance(anchor, SegmentAnchor)
+            else SegmentAnchor(*(float(value) for value in anchor))
+        )
+        segment = model.segments[segment_index]
+        merged = tuple(sorted([*segment.anchors, parsed], key=lambda item: item.stamp))
+        updated = model.replacing({segment_index: SegmentClock(segment_index, merged)})
+        interp_name = name or f"late-anchor:{anchor_id}"
+        note = note or (
+            f"迟到锚点 {anchor_id} 只应用于序号范围 {applies_to}，其余观测维持原版本"
+        )
+        return self._register_interpretation(
+            interp_name,
+            sensor,
+            updated,
+            anchor_ids=(anchor_id,),
+            applies_to=applies_to,
+            note=note,
+        )
+
+    def interpretation_comparison(self, name: str) -> DelayComparison:
+        return self.interpretation_comparisons[self._require_interpretation(name).name]
+
+    def compare_interpretations(
+        self, sensor: str | None = None
+    ) -> tuple[InterpretationComparisonEntry, ...]:
+        """List every registered candidate next to its current comparison.
+
+        Pending comparisons are refreshed against the live calibration so
+        corrected-time ranges and downstream trajectory effects stay
+        traceable for each explanation.
+        """
+        entries: list[InterpretationComparisonEntry] = []
+        for name, interp in self.interpretations.items():
+            if sensor is not None and interp.sensor != sensor:
+                continue
+            if interp.status == "pending":
+                self.interpretation_comparisons[name] = self.compare_calibrations(
+                    interp.sensor,
+                    self.calibration,
+                    self.calibration.with_reboot_clock(interp.clock),
+                )
+            entries.append(
+                InterpretationComparisonEntry(
+                    name,
+                    interp.sensor,
+                    interp.status,
+                    interp.note,
+                    interp.anchor_ids,
+                    interp.adopted_sequences,
+                    self.interpretation_comparisons[name],
+                )
+            )
+        return tuple(entries)
+
+    def adopt_interpretation(self, name: str) -> RecomputeReport:
+        """Explicitly publish one pending candidate; nothing adopts itself."""
+        interp = self._require_interpretation(name)
+        if interp.status != "pending":
+            raise RuntimeError(
+                f"interpretation {name!r} is {interp.status}; "
+                "only pending candidates can be adopted"
+            )
+        self.staged_calibration = self.calibration.with_reboot_clock(interp.clock)
+        self.staged_sensor = interp.sensor
+        self.staged_comparison = self.compare_calibrations(
+            interp.sensor, self.calibration, self.staged_calibration
+        )
+        report = self.publish_staged_delay()
+        self.interpretations[name] = replace(interp, status="adopted")
+        return report
+
+    def discard_interpretation(self, name: str) -> None:
+        """Withdraw a pending candidate explicitly; others are unaffected."""
+        interp = self._require_interpretation(name)
+        if interp.status != "pending":
+            raise RuntimeError(
+                f"interpretation {name!r} is {interp.status}; cannot discard"
+            )
+        del self.interpretations[name]
+        self.interpretation_comparisons.pop(name, None)
+
+    def retract_anchor(self, anchor_id: str) -> AnchorRetraction:
+        """Withdraw an anchor and list every interpretation depending on it.
+
+        Dependent interpretations are kept with status
+        ``anchor_retracted`` for traceability instead of being silently
+        rewritten or deleted; unrelated candidates stay pending.
+        """
+        if anchor_id not in self.anchor_records:
+            raise KeyError(f"unknown anchor {anchor_id!r}")
+        self.anchor_records.pop(anchor_id)
+        dependents = tuple(
+            name
+            for name, interp in self.interpretations.items()
+            if interp.status == "pending" and anchor_id in interp.anchor_ids
+        )
+        for name in dependents:
+            self.interpretations[name] = replace(
+                self.interpretations[name], status="anchor_retracted"
+            )
+        return AnchorRetraction(anchor_id, dependents)
+
+    def _register_interpretation(
+        self,
+        name: str,
+        sensor: str,
+        model: SegmentedSensorClock,
+        *,
+        anchor_ids: tuple[str, ...],
+        applies_to: tuple[int, int] | None,
+        note: str,
+    ) -> DelayComparison:
+        if name in self.interpretations:
+            raise ValueError(
+                f"interpretation {name!r} already registered; "
+                "choose a new name instead of overriding it"
+            )
+        clock: object = model
+        adopted: tuple[int, ...] | None = None
+        if applies_to is not None:
+            low, high = applies_to
+            adopted = tuple(
+                item.sequence
+                for item in self.received
+                if item.sensor == sensor and low <= item.sequence <= high
+            )
+            adopted = tuple(sorted(adopted))
+            base = self.calibration.reboot_clock_for(sensor)
+            if base is None:
+                base = self.calibration.clock_for(sensor)
+            clock = PartialAdoptionClock(sensor, base, model, frozenset(adopted))
+        interpretation = Interpretation(
+            name, sensor, clock, tuple(anchor_ids), adopted, note
+        )
+        self.interpretations[name] = interpretation
+        comparison = self.compare_calibrations(
+            sensor, self.calibration, self.calibration.with_reboot_clock(clock)
+        )
+        self.interpretation_comparisons[name] = comparison
+        return comparison
+
+    def _require_interpretation(self, name: str) -> Interpretation:
+        if name not in self.interpretations:
+            raise KeyError(f"unknown interpretation {name!r}")
+        return self.interpretations[name]
+
     # ------------------------------------------------------------- inspection
 
     def state(self) -> StateEstimate:
@@ -512,6 +785,8 @@ class LocalizationPipeline:
             dict(self.rejected_observations),
             self.staged_calibration,
             self.staged_sensor,
+            list(self.anchor_records.values()),
+            list(self.interpretations.values()),
         )
         self.checkpoints.append(checkpoint)
         return checkpoint
@@ -558,6 +833,28 @@ class LocalizationPipeline:
         else:
             self.staged_comparison = None
         self.checkpoints = [checkpoint]
+        self.anchor_records = {}
+        for item in checkpoint.anchor_records:
+            record = (
+                item
+                if isinstance(item, AnchorRecord)
+                else AnchorRecord.from_dict(item)
+            )
+            self.anchor_records[record.anchor_id] = record
+        self.interpretations = {}
+        self.interpretation_comparisons = {}
+        for item in checkpoint.pending_interpretations:
+            interp = (
+                item
+                if isinstance(item, Interpretation)
+                else Interpretation.from_dict(item)
+            )
+            self.interpretations[interp.name] = interp
+            self.interpretation_comparisons[interp.name] = self.compare_calibrations(
+                interp.sensor,
+                self.calibration,
+                self.calibration.with_reboot_clock(interp.clock),
+            )
 
     def replay(self) -> list[StateEstimate]:
         if self.arrival_horizon is None:
@@ -985,6 +1282,8 @@ class LocalizationPipeline:
                     dict(self.rejected_observations),
                     self.staged_calibration,
                     self.staged_sensor,
+                    list(self.anchor_records.values()),
+                    list(self.interpretations.values()),
                 )
             )
 

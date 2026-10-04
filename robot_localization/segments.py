@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from .calibration import ClockAnchor
+from .calibration import ClockAnchor, SensorClockModel
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +302,105 @@ class SegmentedSensorClock:
             ],
             "boundaries": [item.as_dict() for item in self.boundaries],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class PartialAdoptionClock:
+    """A reboot clock explanation adopted only for chosen sequences.
+
+    A late anchor can justify a new explanation for part of the stream while
+    every other observation keeps its original version.  Sequences listed in
+    ``adopted_sequences`` follow ``candidate``; all others fall back to
+    ``base`` (the previously published clock).  Raw stamps, sequences and
+    identities are never rewritten.
+    """
+
+    sensor: str
+    base: object  # SegmentedSensorClock | SensorClockModel
+    candidate: "SegmentedSensorClock"
+    adopted_sequences: frozenset[int] = frozenset()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "adopted_sequences", frozenset(self.adopted_sequences)
+        )
+
+    def adopts(self, sequence: int) -> bool:
+        return sequence in self.adopted_sequences
+
+    def corrected_time_at(self, sequence: int, stamp: float) -> float:
+        if self.adopts(sequence):
+            return self.candidate.corrected_time_at(sequence, stamp)
+        return _base_corrected_time(self.base, sequence, stamp)
+
+    def corrected_range(self, sequence: int, stamp: float) -> tuple[float, float]:
+        if self.adopts(sequence):
+            return self.candidate.corrected_range(sequence, stamp)
+        return _base_corrected_range(self.base, sequence, stamp)
+
+    def offset_at(self, sequence: int, stamp: float) -> float:
+        return stamp - self.corrected_time_at(sequence, stamp)
+
+    # Segment introspection delegates to the candidate explanation so range
+    # and contradiction reporting stay available for partial candidates.
+    @property
+    def segments(self) -> tuple[SegmentClock, ...]:
+        return self.candidate.segments
+
+    @property
+    def boundaries(self) -> tuple[RebootBoundary, ...]:
+        return self.candidate.boundaries
+
+    def segment_index_for(self, sequence: int) -> int:
+        return self.candidate.segment_index_for(sequence)
+
+    def segment_for(self, sequence: int) -> SegmentClock:
+        return self.candidate.segment_for(sequence)
+
+    def boundary_after_segment(self, index: int) -> RebootBoundary | None:
+        return self.candidate.boundary_after_segment(index)
+
+    def uncalibrated_segments(self) -> tuple[int, ...]:
+        return self.candidate.uncalibrated_segments()
+
+    def single_anchor_segments(self) -> tuple[int, ...]:
+        return self.candidate.single_anchor_segments()
+
+    def segment_corrected_spans(self) -> tuple[tuple[float, float] | None, ...]:
+        return self.candidate.segment_corrected_spans()
+
+    def contradictions(self) -> tuple[dict[str, object], ...]:
+        return self.candidate.contradictions()
+
+    def replacing(self, segment_updates, boundary_updates=None):
+        return self.candidate.replacing(segment_updates, boundary_updates)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "type": "partial_adoption",
+            "base": self.base.as_dict(),
+            "candidate": self.candidate.as_dict(),
+            "adopted_sequences": sorted(self.adopted_sequences),
+        }
+
+
+def _base_corrected_time(base: object, sequence: int, stamp: float) -> float:
+    if isinstance(base, SegmentedSensorClock):
+        return base.corrected_time_at(sequence, stamp)
+    if isinstance(base, SensorClockModel):
+        return base.corrected_time_at(stamp)
+    raise TypeError(f"unsupported partial-adoption base clock: {type(base)!r}")
+
+
+def _base_corrected_range(
+    base: object, sequence: int, stamp: float
+) -> tuple[float, float]:
+    if isinstance(base, SegmentedSensorClock):
+        return base.corrected_range(sequence, stamp)
+    if isinstance(base, SensorClockModel):
+        point = base.corrected_time_at(stamp)
+        return point, point
+    raise TypeError(f"unsupported partial-adoption base clock: {type(base)!r}")
 
 
 def _parse_anchor(

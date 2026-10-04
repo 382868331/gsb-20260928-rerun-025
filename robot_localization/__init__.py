@@ -2,9 +2,11 @@
 
 from .calibration import ClockAnchor, DelayCalibration, SensorClockModel, SensorDelayModel
 from .estimator import LocalizationEstimator, StateEstimate
+from .interpretations import AnchorRecord, AnchorRetraction, Interpretation
 from .pipeline import (
     DelayComparison,
     DelaySettingView,
+    InterpretationComparisonEntry,
     LocalizationPipeline,
     ObservationDecision,
     RecomputeReport,
@@ -15,6 +17,7 @@ from .pipeline import (
 )
 from .recording import CheckpointStore, JsonlMessageSource, JsonlRecorder
 from .segments import (
+    PartialAdoptionClock,
     RebootBoundary,
     SegmentAnchor,
     SegmentClock,
@@ -50,4 +53,9 @@ __all__ = [
     "SegmentAnchor",
     "SegmentClock",
     "SegmentedSensorClock",
+    "PartialAdoptionClock",
+    "AnchorRecord",
+    "AnchorRetraction",
+    "Interpretation",
+    "InterpretationComparisonEntry",
 ]

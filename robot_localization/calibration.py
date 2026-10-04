@@ -126,7 +126,10 @@ class DelayCalibration:
     ) -> None:
         self._models: dict[str, SensorClockModel] = {}
         for sensor, model in (models or {}).items():
-            if isinstance(model, dict) and model.get("type") == REBOOT_CLOCK_TYPE:
+            if isinstance(model, dict) and model.get("type") in (
+                REBOOT_CLOCK_TYPE,
+                "partial_adoption",
+            ):
                 continue
             if isinstance(model, SensorClockModel):
                 clock = SensorClockModel(sensor, model.anchors)
@@ -166,12 +169,30 @@ class DelayCalibration:
     @staticmethod
     def _reboot_from_dict_or_value(sensor: str, model: object):
         from .segments import (
+            PartialAdoptionClock,
             RebootBoundary,
             SegmentAnchor,
             SegmentClock,
             SegmentedSensorClock,
         )
 
+        if isinstance(model, PartialAdoptionClock):
+            return model
+        if isinstance(model, dict) and model.get("type") == "partial_adoption":
+            base_payload = model["base"]
+            if isinstance(base_payload, dict) and base_payload.get("type") == REBOOT_CLOCK_TYPE:
+                base = DelayCalibration._reboot_from_dict_or_value(sensor, base_payload)
+            else:
+                base = DelayCalibration._model_from_dict(sensor, base_payload)
+            candidate = DelayCalibration._reboot_from_dict_or_value(
+                sensor, model["candidate"]
+            )
+            return PartialAdoptionClock(
+                sensor,
+                base,
+                candidate,
+                frozenset(int(item) for item in model.get("adopted_sequences", ())),
+            )
         if isinstance(model, SegmentedSensorClock):
             return SegmentedSensorClock(sensor, model.segments, model.boundaries)
         if isinstance(model, dict) and model.get("type") == REBOOT_CLOCK_TYPE:

@@ -47,6 +47,14 @@ python -m robot_localization.cli --output-dir outputs
 
 `RebootScenarioSource` 生成含缓慢漂移、两次归零和迟到观测的记录；`tests/test_reboot_segments.py` 覆盖同戳不同段、单锚点/推测窗口范围、跨段矛盾、交错与迟到排序、封存逐条决策、方案比较、逐段确认互不影响以及保存恢复。
 
+## 多解释登记与迟到锚点
+
+当设备时钟重置只能确定在某个序号范围时，可以并排登记多套“边界 + 漂移锚点”解释：`register_interpretation(name, sensor, boundaries=..., anchors=...)` 只把候选存入登记表并立即给出与现行校时的 `DelayComparison`，绝不自动发布；后登记的候选不会覆盖先登记的，重名直接报错。`compare_interpretations(sensor)` 对每套候选刷新比较，逐身份列出校正时刻、可重算范围与下游轨迹位置变化；只有显式调用 `adopt_interpretation(name)` 才会发布其中一套，`discard_interpretation(name)` 则明确撤回。观测的原始时间、序号与采集身份始终不变。
+
+在重置两侧出现相同原始时间后补入迟到锚点时，`register_late_anchor(anchor_id, sensor, segment_index, anchor, applies_to=(lo, hi))` 生成只采用部分观测的新解释（`PartialAdoptionClock`）：序号落在 `applies_to` 内的观测按新解释校正，其余观测维持原版本。锚点先经 `register_anchor` 登记来源与到达时间；`retract_anchor(anchor_id)` 撤回锚点时返回 `AnchorRetraction`，列出所有依赖它的解释并把它们标记为 `anchor_retracted`（保留可追溯，不可再采用），无关候选不受影响。
+
+未决候选随检查点保存（`anchor_records` 与 `pending_interpretations`），重开后恢复同一登记表并重新计算比较，范围与下游采用依据仍可追溯；`tests/test_interpretations.py` 覆盖多解释比较、显式采用、迟到锚点部分采用、锚点撤回依赖清单以及保存恢复。
+
 默认示例同时运行零延迟（未校正）基线与时钟校正运行，`metrics.json` 输出两者的位置 RMSE、95% 半径覆盖率、已发布重算记录、两套时钟解释的逐身份并排比较、未发布校时的撤销记录、开放区间不确定空窗以及恢复前后的可见边界；`trajectory.csv` 增加 `raw_position_error` 与 `sealed` 列。
 
 ## 测试

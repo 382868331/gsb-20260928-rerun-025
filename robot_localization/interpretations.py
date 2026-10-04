@@ -17,6 +17,7 @@ class AnchorRecord:
     anchor: SegmentAnchor
     arrival_time: float | None = None
     applies_to: tuple[int, int] | None = None
+    source: str = ""
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -28,6 +29,7 @@ class AnchorRecord:
             "applies_to": (
                 None if self.applies_to is None else list(self.applies_to)
             ),
+            "source": self.source,
         }
 
     @classmethod
@@ -45,6 +47,7 @@ class AnchorRecord:
             ),
             payload.get("arrival_time"),
             None if applies_to is None else (int(applies_to[0]), int(applies_to[1])),
+            str(payload.get("source", "")),
         )
 
 

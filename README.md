@@ -55,6 +55,17 @@ python -m robot_localization.cli --output-dir outputs
 
 未决候选随检查点保存（`anchor_records` 与 `pending_interpretations`），重开后恢复同一登记表并重新计算比较，范围与下游采用依据仍可追溯；`tests/test_interpretations.py` 覆盖多解释比较、显式采用、迟到锚点部分采用、锚点撤回依赖清单以及保存恢复。
 
+## 多候选对比与筛选
+
+在登记表之上可以只读地筛选和并排比较多套解释，比较本身不采用候选、不改变原始观测、不改写已发布版本：
+
+- `filter_interpretations(sensor=..., sequence_range=..., anchor_source=..., status=...)` 按观测序号范围、锚点来源（`register_anchor(..., source=...)` 登记的出处）和解释状态（`pending` / `adopted` / `anchor_retracted`）筛选候选，返回的仍是各自与现行校时的 `DelayComparison`。
+- `compare_interpretation_set(names, conflicts_only=...)` 选择两份及以上同一传感器的解释，在重叠观测（各候选采用范围的交集）上逐身份对齐校正时间：结果分成 `time_differs`（时间结果不同）、`same_time_different_basis`（时间相同但段/锚点依据不同）、`identical`（完全一致）三组；`conflicts_only=True` 时只列出冲突观测，仍保留 `identical_count`。每套候选的 `CandidateSummary` 并排给出各段漂移假设（锚点偏移、隐含漂移率、单锚点标记）与锚点依据（来源、到达时间、适用范围）。
+- `export_interpretation_set(names, path, conflicts_only=...)` 把当前比较结果（分组、计数、候选依据）写成 JSON 文件；`comparison.as_dict()` 也可直接序列化。
+- `save_comparison_view(filters=..., selection=..., conflicts_only=...)` 把筛选条件和比较选择随检查点保存（`comparison_view`），重开后 `resume_comparison_view()` 用同一条件重新筛选并对所选候选重新对齐，不恢复成任何已发布状态。
+
+`tests/test_comparison_view.py` 覆盖三维筛选、三组分类、只看冲突、导出、部分采用候选的重叠范围、比较的只读性以及筛选/选择的保存恢复。
+
 默认示例同时运行零延迟（未校正）基线与时钟校正运行，`metrics.json` 输出两者的位置 RMSE、95% 半径覆盖率、已发布重算记录、两套时钟解释的逐身份并排比较、未发布校时的撤销记录、开放区间不确定空窗以及恢复前后的可见边界；`trajectory.csv` 增加 `raw_position_error` 与 `sealed` 列。
 
 ## 测试

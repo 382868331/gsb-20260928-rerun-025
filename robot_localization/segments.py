@@ -23,17 +23,28 @@ class RebootBoundary:
     ``confirmed`` describes an explicit reboot record.  ``reset_window`` is the
     possible reboot position on the trajectory axis when the reset itself was
     not recorded; ``None`` means the boundary location is not bounded yet.
+    ``sequence_range`` bounds the reset to an inclusive range of candidate
+    ``after_sequence`` cuts when the exact reset sequence is unknown; the
+    nominal cut stays explicit and alternative cuts are compared as separate
+    interpretations rather than silently replacing one another.
     """
 
     after_sequence: int
     confirmed: bool = True
     reset_window: tuple[float, float] | None = None
+    sequence_range: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if self.reset_window is not None:
             low, high = self.reset_window
             if high < low - 1e-12:
                 raise ValueError("reset window lower bound must precede upper bound")
+        if self.sequence_range is not None:
+            low, high = self.sequence_range
+            if high < low:
+                raise ValueError("sequence range lower bound must precede upper bound")
+            if not low <= self.after_sequence <= high:
+                raise ValueError("nominal boundary cut must lie inside the sequence range")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -41,6 +52,9 @@ class RebootBoundary:
             "confirmed": self.confirmed,
             "reset_window": (
                 None if self.reset_window is None else list(self.reset_window)
+            ),
+            "sequence_range": (
+                None if self.sequence_range is None else list(self.sequence_range)
             ),
         }
 
@@ -331,6 +345,14 @@ def _parse_boundary(
             int(value["after_sequence"]),
             bool(value.get("confirmed", True)),
             None if window is None else (float(window[0]), float(window[1])),
+            (
+                None
+                if value.get("sequence_range") is None
+                else (
+                    int(value["sequence_range"][0]),
+                    int(value["sequence_range"][1]),
+                )
+            ),
         )
     if len(value) == 1:
         return RebootBoundary(int(value[0]))
@@ -340,6 +362,16 @@ def _parse_boundary(
         window = value[2]
         low, high = window[0], window[1]
         return RebootBoundary(int(value[0]), False, (float(low), float(high)))
+    if len(value) == 4:
+        window = value[2]
+        low, high = window[0], window[1]
+        sequence_range = value[3]
+        return RebootBoundary(
+            int(value[0]),
+            False,
+            (float(low), float(high)),
+            (int(sequence_range[0]), int(sequence_range[1])),
+        )
     raise ValueError(
         "reboot boundary needs a sequence cut, optionally with confidence/window"
     )

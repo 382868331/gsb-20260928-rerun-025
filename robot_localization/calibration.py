@@ -118,14 +118,37 @@ class SensorClockModel:
 
 
 class DelayCalibration:
-    """Maps each sensor to its current clock correction."""
+    """Maps each sensor to its current clock correction.
+
+    A calibration may also be *selective*: a baseline explanation plus a
+    candidate explanation that is adopted only for an explicit set of
+    ``(sensor, sequence)`` identities.  Every other observation keeps the
+    baseline version, so a late anchor never silently re-times observations
+    the user did not opt in.
+    """
 
     def __init__(
         self,
         models: dict[str, float | SensorClockModel | dict[str, object]] | None = None,
     ) -> None:
+        self._selective: (
+            tuple[DelayCalibration, DelayCalibration, frozenset[tuple[str, int]]]
+            | None
+        ) = None
+        models = models or {}
+        if "__selective__" in models:
+            payload = models["__selective__"]
+            baseline = DelayCalibration(payload.get("baseline", {}))
+            candidate = DelayCalibration(payload.get("candidate", {}))
+            adopted = frozenset(
+                (str(item[0]), int(item[1])) for item in payload.get("adopted", [])
+            )
+            self._selective = (baseline, candidate, adopted)
+            self._models = dict(baseline._models)
+            self._reboot_models = dict(baseline._reboot_models)
+            return
         self._models: dict[str, SensorClockModel] = {}
-        for sensor, model in (models or {}).items():
+        for sensor, model in models.items():
             if isinstance(model, dict) and model.get("type") == REBOOT_CLOCK_TYPE:
                 continue
             if isinstance(model, SensorClockModel):
@@ -139,7 +162,7 @@ class DelayCalibration:
             self._models[sensor] = clock
 
         self._reboot_models: dict[str, "object"] = {}
-        for sensor, model in (models or {}).items():
+        for sensor, model in models.items():
             reboot_clock = self._reboot_from_dict_or_value(sensor, model)
             if reboot_clock is not None:
                 self._reboot_models[sensor] = reboot_clock
@@ -202,26 +225,84 @@ class DelayCalibration:
                                 float(item["reset_window"][0]),
                                 float(item["reset_window"][1]),
                             )
-                        ),
-                    )
-                    for item in model.get("boundaries", [])
+                         ),
+                         (
+                             None
+                             if item.get("sequence_range") is None
+                             else (
+                                 int(item["sequence_range"][0]),
+                                 int(item["sequence_range"][1]),
+                             )
+                         ),
+                     )
+                     for item in model.get("boundaries", [])
                 ),
             )
         return None
 
     def clock_for(self, sensor: str) -> SensorClockModel:
+        delegate = self._delegate_sensor(sensor)
+        if delegate is not self:
+            return delegate.clock_for(sensor)
         return self._models.get(sensor, SensorClockModel(sensor))
 
     def clock_items(self) -> tuple[tuple[str, SensorClockModel], ...]:
+        if self._selective is not None:
+            baseline, candidate, _ = self._selective
+            merged = dict(baseline.clock_items())
+            merged.update(dict(candidate.clock_items()))
+            return tuple(merged.items())
         return tuple(self._models.items())
+
+    def _delegate_sensor(self, sensor: str) -> "DelayCalibration":
+        if self._selective is not None:
+            baseline, candidate, _ = self._selective
+            return candidate if candidate._has_model(sensor) else baseline
+        return self
 
     def delay_for(self, sensor: str) -> float:
         return self.clock_for(sensor).delay
+
+    def _has_model(self, sensor: str) -> bool:
+        return sensor in self._models or sensor in self._reboot_models
+
+    def _source_for(self, observation: Observation) -> "DelayCalibration | None":
+        if self._selective is None:
+            return None
+        baseline, candidate, adopted = self._selective
+        if (observation.sensor, observation.sequence) in adopted:
+            return candidate
+        return baseline
+
+    def with_selective(
+        self,
+        candidate: "DelayCalibration",
+        adopted: Iterable[tuple[str, int]],
+    ) -> "DelayCalibration":
+        """Adopt candidate only for the listed observation identities."""
+        clone = DelayCalibration()
+        clone._models = dict(self._models)
+        clone._reboot_models = dict(self._reboot_models)
+        clone._selective = (self, candidate, frozenset(adopted))
+        return clone
+
+    def adopted_identities(self) -> frozenset[tuple[str, int]] | None:
+        if self._selective is None:
+            return None
+        return self._selective[2]
+
+    def selective_parts(
+        self,
+    ) -> tuple["DelayCalibration", "DelayCalibration", frozenset[tuple[str, int]]] | None:
+        return self._selective
 
     def offset_for(self, sensor: str, stamp: float) -> float:
         return self.clock_for(sensor).offset_at(stamp)
 
     def corrected_time(self, observation: Observation) -> float:
+        source = self._source_for(observation)
+        if source is not None:
+            return source.corrected_time(observation)
         reboot = self._reboot_models.get(observation.sensor)
         if reboot is not None:
             return reboot.corrected_time_at(observation.sequence, observation.time)
@@ -229,6 +310,9 @@ class DelayCalibration:
 
     def corrected_range(self, observation: Observation) -> tuple[float, float]:
         """Reliable corrected-time interval; wider than a point when anchors are weak."""
+        source = self._source_for(observation)
+        if source is not None:
+            return source.corrected_range(observation)
         reboot = self._reboot_models.get(observation.sensor)
         if reboot is not None:
             return reboot.corrected_range(observation.sequence, observation.time)
@@ -236,9 +320,15 @@ class DelayCalibration:
         return point, point
 
     def reboot_clock_for(self, sensor: str):
+        delegate = self._delegate_sensor(sensor)
+        if delegate is not self:
+            return delegate.reboot_clock_for(sensor)
         return self._reboot_models.get(sensor)
 
     def segment_index_for(self, observation: Observation) -> int | None:
+        source = self._source_for(observation)
+        if source is not None:
+            return source.segment_index_for(observation)
         reboot = self._reboot_models.get(observation.sensor)
         if reboot is None:
             return None
@@ -316,6 +406,15 @@ class DelayCalibration:
         return min(times), max(times)
 
     def as_dict(self) -> dict[str, object]:
+        if self._selective is not None:
+            baseline, candidate, adopted = self._selective
+            return {
+                "__selective__": {
+                    "baseline": baseline.as_dict(),
+                    "candidate": candidate.as_dict(),
+                    "adopted": sorted([list(item) for item in adopted]),
+                }
+            }
         result = {sensor: model.as_dict() for sensor, model in self._models.items()}
         result.update(
             {

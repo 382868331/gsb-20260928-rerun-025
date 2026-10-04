@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
+from typing import Iterable
 
 from .calibration import DelayCalibration, SensorClockModel
 from .estimator import LocalizationEstimator, StateEstimate
@@ -8,6 +9,7 @@ from .segments import (
     RebootBoundary,
     SegmentedSensorClock,
 )
+from .segments import SegmentAnchor, _parse_boundary
 from .types import Observation
 
 
@@ -23,6 +25,8 @@ class Checkpoint:
     rejected_observations: dict[tuple[str, int], str] = field(default_factory=dict)
     staged_calibration: DelayCalibration | None = None
     staged_sensor: str | None = None
+    registered_anchors: tuple["RegisteredAnchor", ...] = ()
+    pending_interpretations: tuple["Interpretation", ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +75,7 @@ class SegmentView:
     reset_window: tuple[float, float] | None
     status: str
     reason: str
+    sequence_window: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +141,112 @@ class UncertainInterval:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class RegisteredAnchor:
+    """An anchor kept in the registry so interpretations can cite it.
+
+    ``late`` marks anchors that only became known after duplicate raw stamps
+    had already been observed on both sides of a reset; such anchors justify
+    a new interpretation but never rewrite the raw observations.
+    """
+
+    anchor_id: str
+    sensor: str
+    segment_index: int
+    anchor: SegmentAnchor
+    late: bool = False
+    note: str = ""
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "anchor_id": self.anchor_id,
+            "sensor": self.sensor,
+            "segment_index": self.segment_index,
+            "anchor": self.anchor.as_dict(),
+            "late": self.late,
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "RegisteredAnchor":
+        anchor = payload["anchor"]
+        return cls(
+            str(payload["anchor_id"]),
+            str(payload["sensor"]),
+            int(payload["segment_index"]),
+            SegmentAnchor(
+                float(anchor["stamp"]),
+                float(anchor["corrected_time"]),
+                float(anchor.get("uncertainty", 0.0)),
+            ),
+            bool(payload.get("late", False)),
+            str(payload.get("note", "")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Interpretation:
+    """One pending boundary/anchor explanation held for comparison.
+
+    Registering an interpretation never publishes it and never overwrites a
+    previously registered one; ``adopted_identities`` is ``None`` when the
+    candidate covers every observation of the sensor, or the explicit set of
+    ``(sensor, sequence)`` identities a partial explanation applies to.
+    """
+
+    name: str
+    sensor: str
+    calibration: DelayCalibration
+    anchor_ids: tuple[str, ...]
+    adopted_identities: frozenset[tuple[str, int]] | None
+    comparison: "DelayComparison | None"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "sensor": self.sensor,
+            "calibration": self.calibration.as_dict(),
+            "anchor_ids": list(self.anchor_ids),
+            "adopted_identities": (
+                None
+                if self.adopted_identities is None
+                else sorted([list(item) for item in self.adopted_identities])
+            ),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, payload: dict[str, object], comparison: "DelayComparison | None" = None
+    ) -> "Interpretation":
+        adopted = payload.get("adopted_identities")
+        return cls(
+            str(payload["name"]),
+            str(payload["sensor"]),
+            DelayCalibration(payload["calibration"]),
+            tuple(str(item) for item in payload.get("anchor_ids", [])),
+            (
+                None
+                if adopted is None
+                else frozenset((str(item[0]), int(item[1])) for item in adopted)
+            ),
+            comparison,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AnchorWithdrawal:
+    """Result of withdrawing a registered anchor.
+
+    Every pending interpretation that cited the anchor is dropped and listed
+    so the caller can see exactly which explanations depended on it; the
+    published calibration is never changed implicitly.
+    """
+
+    anchor_id: str
+    dropped_interpretations: tuple[str, ...]
+    reason: str
+
+
 class SealedHistoryError(RuntimeError):
     """Raised when a delay change would silently overwrite sealed outputs."""
 
@@ -182,6 +293,8 @@ class LocalizationPipeline:
         self.staged_calibration: DelayCalibration | None = None
         self.staged_comparison: DelayComparison | None = None
         self.staged_sensor: str | None = None
+        self.registered_anchors: dict[str, RegisteredAnchor] = {}
+        self.interpretations: dict[str, Interpretation] = {}
 
     # ------------------------------------------------------------------ ingest
 
@@ -227,6 +340,7 @@ class LocalizationPipeline:
                 dict(self.rejected_observations),
                 self.staged_calibration,
                 self.staged_sensor,
+                *self._registry_snapshot(),
             )
         )
         return list(self.outputs)
@@ -275,6 +389,7 @@ class LocalizationPipeline:
                 dict(self.rejected_observations),
                 self.staged_calibration,
                 self.staged_sensor,
+                *self._registry_snapshot(),
             )
         )
         return list(self.sealed_outputs)
@@ -370,6 +485,170 @@ class LocalizationPipeline:
         self.staged_comparison = comparison
         self.staged_sensor = sensor
         return comparison
+
+    # -------------------------------------------------- interpretations
+
+    def register_anchor(
+        self,
+        sensor: str,
+        segment_index: int,
+        anchor: SegmentAnchor | tuple,
+        *,
+        anchor_id: str | None = None,
+        late: bool = False,
+        note: str = "",
+    ) -> RegisteredAnchor:
+        """Register an anchor so pending interpretations can cite it."""
+        if not isinstance(anchor, SegmentAnchor):
+            anchor = SegmentAnchor(*(float(value) for value in anchor))
+        if anchor_id is None:
+            anchor_id = f"{sensor}:{segment_index}:{len(self.registered_anchors)}"
+        if anchor_id in self.registered_anchors:
+            raise ValueError(f"anchor id {anchor_id!r} is already registered")
+        record = RegisteredAnchor(
+            anchor_id, sensor, int(segment_index), anchor, bool(late), note
+        )
+        self.registered_anchors[anchor_id] = record
+        return record
+
+    def register_interpretation(
+        self,
+        name: str,
+        sensor: str,
+        *,
+        boundaries: list[RebootBoundary | tuple | dict] | None = None,
+        segment_anchors: dict[int, list[tuple]] | None = None,
+        anchor_ids: Iterable[str] = (),
+        adopt: Iterable[tuple[str, int]] | None = None,
+    ) -> DelayComparison:
+        """Register one pending boundary/anchor explanation for comparison.
+
+        The candidate is compared against the current calibration and stored
+        under ``name``; nothing is published and an existing interpretation
+        with the same name is never silently overwritten.  ``adopt`` limits
+        the explanation to an explicit set of observation identities; every
+        other observation keeps its current (baseline) corrected time.
+        """
+        if name in self.interpretations:
+            raise ValueError(
+                f"interpretation {name!r} already exists; candidates never "
+                "auto-overwrite a registered explanation"
+            )
+        replacements = {
+            int(index): list(items) for index, items in (segment_anchors or {}).items()
+        }
+        additions: dict[int, list[SegmentAnchor]] = {}
+        cited: list[str] = []
+        for anchor_id in anchor_ids:
+            if anchor_id not in self.registered_anchors:
+                raise ValueError(f"unknown anchor id {anchor_id!r}")
+            record = self.registered_anchors[anchor_id]
+            if record.sensor != sensor:
+                raise ValueError(
+                    f"anchor {anchor_id!r} belongs to sensor {record.sensor!r}"
+                )
+            additions.setdefault(record.segment_index, []).append(record.anchor)
+            cited.append(anchor_id)
+        base_model = self.calibration.reboot_clock_for(sensor)
+        indices = set(replacements) | set(additions)
+        if base_model is None:
+            if boundaries is None:
+                raise ValueError(
+                    "boundaries are required to start reboot interpretations"
+                )
+            combined = {
+                index: replacements.get(index, []) + additions.get(index, [])
+                for index in indices
+            }
+            candidate_model = SegmentedSensorClock.from_anchors(
+                sensor,
+                {
+                    index: _sorted_anchors(items)
+                    for index, items in combined.items()
+                }.items(),
+                boundaries,
+            )
+        else:
+            updates = {}
+            for index in indices:
+                if not 0 <= index < len(base_model.segments):
+                    raise ValueError(f"unknown reboot segment {index}")
+                existing = (
+                    replacements[index]
+                    if index in replacements
+                    else list(base_model.segments[index].anchors)
+                )
+                updates[index] = _sorted_anchors(existing + additions.get(index, []))
+            boundary_updates = None
+            if boundaries is not None:
+                parsed = [_parse_boundary(item) for item in boundaries]
+                if len(parsed) != len(base_model.boundaries):
+                    raise ValueError(
+                        "boundary update must cover every existing boundary"
+                    )
+                boundary_updates = dict(enumerate(parsed))
+            candidate_model = base_model.replacing(updates, boundary_updates)
+        candidate = self.calibration.with_reboot_clock(candidate_model)
+        adopted = (
+            None
+            if adopt is None
+            else frozenset((str(item[0]), int(item[1])) for item in adopt)
+        )
+        if adopted is not None:
+            candidate = self.calibration.with_selective(candidate, adopted)
+        comparison = self.compare_calibrations(sensor, self.calibration, candidate)
+        self.interpretations[name] = Interpretation(
+            name, sensor, candidate, tuple(cited), adopted, comparison
+        )
+        return comparison
+
+    def interpretation_comparisons(self) -> dict[str, DelayComparison]:
+        """Side-by-side comparisons of every pending interpretation."""
+        return {
+            name: interpretation.comparison
+            for name, interpretation in self.interpretations.items()
+        }
+
+    def discard_interpretation(self, name: str) -> None:
+        if name not in self.interpretations:
+            raise ValueError(f"unknown interpretation {name!r}")
+        del self.interpretations[name]
+
+    def publish_interpretation(self, name: str) -> RecomputeReport:
+        """Explicitly publish one registered interpretation by name."""
+        if name not in self.interpretations:
+            raise ValueError(f"unknown interpretation {name!r}")
+        interpretation = self.interpretations.pop(name)
+        self.staged_calibration = interpretation.calibration
+        self.staged_comparison = interpretation.comparison
+        self.staged_sensor = interpretation.sensor
+        return self.publish_staged_delay()
+
+    def withdraw_anchor(self, anchor_id: str) -> AnchorWithdrawal:
+        """Withdraw an anchor and drop every interpretation citing it."""
+        if anchor_id not in self.registered_anchors:
+            raise ValueError(f"unknown anchor id {anchor_id!r}")
+        del self.registered_anchors[anchor_id]
+        dependents = tuple(
+            name
+            for name, interpretation in self.interpretations.items()
+            if anchor_id in interpretation.anchor_ids
+        )
+        for name in dependents:
+            del self.interpretations[name]
+        return AnchorWithdrawal(
+            anchor_id,
+            dependents,
+            "锚点已撤回：依赖它的未决解释一并移除，已发布校时与其他观测保持原版本",
+        )
+
+    def _registry_snapshot(
+        self,
+    ) -> tuple[tuple[RegisteredAnchor, ...], tuple[Interpretation, ...]]:
+        return (
+            tuple(self.registered_anchors.values()),
+            tuple(self.interpretations.values()),
+        )
 
     def discard_staged_delay(self) -> None:
         """Discard a delay revision that has not been published."""
@@ -512,6 +791,7 @@ class LocalizationPipeline:
             dict(self.rejected_observations),
             self.staged_calibration,
             self.staged_sensor,
+            *self._registry_snapshot(),
         )
         self.checkpoints.append(checkpoint)
         return checkpoint
@@ -558,6 +838,23 @@ class LocalizationPipeline:
         else:
             self.staged_comparison = None
         self.checkpoints = [checkpoint]
+
+        self.registered_anchors = {
+            item.anchor_id: item for item in checkpoint.registered_anchors
+        }
+        self.interpretations = {}
+        for item in checkpoint.pending_interpretations:
+            comparison = self.compare_calibrations(
+                item.sensor, self.calibration, item.calibration
+            )
+            self.interpretations[item.name] = Interpretation(
+                item.name,
+                item.sensor,
+                item.calibration,
+                item.anchor_ids,
+                item.adopted_identities,
+                comparison,
+            )
 
     def replay(self) -> list[StateEstimate]:
         if self.arrival_horizon is None:
@@ -916,9 +1213,19 @@ class LocalizationPipeline:
             ) in contradiction_pairs:
                 status = "anchor_conflict"
                 reason = "与相邻重启段的锚点范围互相矛盾，保留范围而不强行拼接"
-            elif boundary is not None and boundary.reset_window is not None:
+            elif boundary is not None and (
+                boundary.reset_window is not None
+                or boundary.sequence_range is not None
+            ):
                 status = "boundary_uncertain"
-                reason = "重启位置只在推测窗口内确认，段内校时随边界窗口保留不确定性"
+                if boundary.sequence_range is not None:
+                    reason = (
+                        "重启只能定位到序号范围 "
+                        f"[{boundary.sequence_range[0]}, {boundary.sequence_range[1]}]，"
+                        "段内校时随边界范围保留不确定性"
+                    )
+                else:
+                    reason = "重启位置只在推测窗口内确认，段内校时随边界窗口保留不确定性"
             else:
                 status = "calibrated"
                 reason = "该段具有独立校时依据"
@@ -934,6 +1241,7 @@ class LocalizationPipeline:
                     None if boundary is None else boundary.reset_window,
                     status,
                     reason,
+                    None if boundary is None else boundary.sequence_range,
                 )
             )
         return tuple(views)
@@ -985,6 +1293,7 @@ class LocalizationPipeline:
                     dict(self.rejected_observations),
                     self.staged_calibration,
                     self.staged_sensor,
+                    *self._registry_snapshot(),
                 )
             )
 
@@ -1008,3 +1317,10 @@ class LocalizationPipeline:
         if estimator is not self.estimator:
             self.estimator = estimator
         return outputs
+
+
+def _sorted_anchors(items: Iterable) -> list:
+    return sorted(
+        items,
+        key=lambda item: item.stamp if isinstance(item, SegmentAnchor) else item[0],
+    )

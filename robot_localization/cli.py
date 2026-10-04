@@ -7,7 +7,14 @@ import math
 from pathlib import Path
 
 from .calibration import DelayCalibration
-from .pipeline import Checkpoint, DelayComparison, LocalizationPipeline, RecomputeReport
+from .pipeline import (
+    Checkpoint,
+    DelayComparison,
+    Interpretation,
+    LocalizationPipeline,
+    RecomputeReport,
+    RegisteredAnchor,
+)
 from .recording import CheckpointStore, JsonlRecorder
 from .sources import SyntheticScenarioSource
 
@@ -132,6 +139,12 @@ def main(argv: list[str] | None = None) -> int:
             else None
         ),
         staged_sensor=checkpoint.staged_sensor,
+        registered_anchors=[
+            item.as_dict() for item in checkpoint.registered_anchors
+        ],
+        pending_interpretations=[
+            item.as_dict() for item in checkpoint.pending_interpretations
+        ],
     )
 
     # Restore must present exactly the same visible data boundary: a message
@@ -152,6 +165,14 @@ def main(argv: list[str] | None = None) -> int:
             else None
         ),
         staged_sensor=metadata["staged_sensor"],
+        registered_anchors=tuple(
+            RegisteredAnchor.from_dict(item)
+            for item in metadata["registered_anchors"]
+        ),
+        pending_interpretations=tuple(
+            Interpretation.from_dict(item)
+            for item in metadata["pending_interpretations"]
+        ),
     )
     restored = LocalizationPipeline()
     restored.restore_checkpoint(loaded_checkpoint)

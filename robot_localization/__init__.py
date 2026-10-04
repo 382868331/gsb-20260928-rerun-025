@@ -3,11 +3,14 @@
 from .calibration import ClockAnchor, DelayCalibration, SensorClockModel, SensorDelayModel
 from .estimator import LocalizationEstimator, StateEstimate
 from .pipeline import (
+    AnchorWithdrawal,
     DelayComparison,
     DelaySettingView,
+    Interpretation,
     LocalizationPipeline,
     ObservationDecision,
     RecomputeReport,
+    RegisteredAnchor,
     SealedHistoryError,
     TimelinePosition,
     TimelinePositionChange,
@@ -46,6 +49,9 @@ __all__ = [
     "TimelinePosition",
     "TimelinePositionChange",
     "UncertainInterval",
+    "AnchorWithdrawal",
+    "Interpretation",
+    "RegisteredAnchor",
     "RebootBoundary",
     "SegmentAnchor",
     "SegmentClock",

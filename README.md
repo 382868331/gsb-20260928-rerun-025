@@ -47,6 +47,14 @@ python -m robot_localization.cli --output-dir outputs
 
 `RebootScenarioSource` 生成含缓慢漂移、两次归零和迟到观测的记录；`tests/test_reboot_segments.py` 覆盖同戳不同段、单锚点/推测窗口范围、跨段矛盾、交错与迟到排序、封存逐条决策、方案比较、逐段确认互不影响以及保存恢复。
 
+## 多解释候选与迟到锚点
+
+当重启只能确定在某个序号范围内时，`RebootBoundary(sequence_range=(low, high))` 记录候选切点范围，名义切点保持显式；`register_interpretation(name, sensor, boundaries=..., segment_anchors=..., anchor_ids=..., adopt=...)` 把每一套“边界 + 漂移锚点”解释登记为未决候选并立即给出与当前校时的 `DelayComparison` 并排比较（校正时刻变化、`position_changes` 的下游轨迹影响）。候选只登记不发布，同名候选拒绝覆盖，发布必须显式 `publish_interpretation(name)`，绝不会被最后一条候选自动顶替；观测的原始 `time`、`sequence` 与身份始终不变。
+
+重置两侧已出现相同原始时间后补到的锚点用 `register_anchor(..., late=True)` 登记，再以 `adopt=[(sensor, sequence), ...]` 生成只采用部分观测的新解释：被采用的身份按候选段内模型校正，其余观测维持原版本（`DelayCalibration` 的 selective 形式随 `as_dict` 持久化）。`withdraw_anchor(anchor_id)` 返回 `AnchorWithdrawal`，列出并移除所有引用该锚点的未决解释，已发布校时不受影响。
+
+已登记锚点与未决解释随检查点保存（`registered_anchors`、`pending_interpretations`）；重开后比较结果、不确定范围与下游采用依据会按恢复后的校时重算，可继续比较、发布或撤回。`tests/test_interpretations.py` 覆盖序号范围多候选比较、迟到锚点部分采用、锚点撤回依赖清单以及保存重开后的可追溯性。
+
 默认示例同时运行零延迟（未校正）基线与时钟校正运行，`metrics.json` 输出两者的位置 RMSE、95% 半径覆盖率、已发布重算记录、两套时钟解释的逐身份并排比较、未发布校时的撤销记录、开放区间不确定空窗以及恢复前后的可见边界；`trajectory.csv` 增加 `raw_position_error` 与 `sealed` 列。
 
 ## 测试

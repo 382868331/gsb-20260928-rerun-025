@@ -48,6 +48,8 @@ class CheckpointStore:
         rejected_observations: dict[tuple[str, int], str] | None = None,
         staged_calibration: dict[str, object] | None = None,
         staged_sensor: str | None = None,
+        registered_anchors: Iterable[dict[str, object]] | None = None,
+        pending_interpretations: Iterable[dict[str, object]] | None = None,
     ) -> None:
         payload = {
             "time": estimate.time,
@@ -73,6 +75,8 @@ class CheckpointStore:
             "fixed_delays": _legacy_fixed_delays(calibration or {}),
             "staged_calibration": staged_calibration,
             "staged_sensor": staged_sensor,
+            "registered_anchors": list(registered_anchors or []),
+            "pending_interpretations": list(pending_interpretations or []),
             "sealed_outputs": [
                 serialize_state(item)
                 for item in (sealed_outputs or [])
@@ -125,6 +129,8 @@ class CheckpointStore:
             },
             "staged_calibration": payload.get("staged_calibration"),
             "staged_sensor": payload.get("staged_sensor"),
+            "registered_anchors": payload.get("registered_anchors", []),
+            "pending_interpretations": payload.get("pending_interpretations", []),
         }
         return estimate, observations, metadata
 
@@ -136,6 +142,8 @@ class CheckpointStore:
 def _legacy_fixed_delays(calibration: dict[str, object]) -> dict[str, float]:
     result: dict[str, float] = {}
     for sensor, model in calibration.items():
+        if sensor.startswith("__"):
+            continue
         if isinstance(model, (int, float)):
             result[sensor] = float(model)
         elif isinstance(model, dict) and model.get("type", "fixed") == "fixed":

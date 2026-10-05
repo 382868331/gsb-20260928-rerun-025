@@ -1,6 +1,13 @@
 """Offline causal robot localization core."""
 
 from .calibration import ClockAnchor, DelayCalibration, SensorClockModel, SensorDelayModel
+from .candidate_compare import (
+    CandidateComparison,
+    CandidateFilter,
+    CandidateSummary,
+    ComparisonSelection,
+    ObservationAlignment,
+)
 from .estimator import LocalizationEstimator, StateEstimate
 from .interpretations import AnchorRecord, AnchorRetraction, Interpretation
 from .pipeline import (
@@ -58,4 +65,9 @@ __all__ = [
     "AnchorRetraction",
     "Interpretation",
     "InterpretationComparisonEntry",
+    "CandidateFilter",
+    "ComparisonSelection",
+    "CandidateComparison",
+    "CandidateSummary",
+    "ObservationAlignment",
 ]

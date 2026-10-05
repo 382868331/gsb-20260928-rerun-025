@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 
 from .calibration import DelayCalibration
+from .candidate_compare import CandidateFilter
 from .pipeline import Checkpoint, DelayComparison, LocalizationPipeline, RecomputeReport
 from .recording import CheckpointStore, JsonlRecorder
 from .sources import SyntheticScenarioSource
@@ -87,6 +88,43 @@ def main(argv: list[str] | None = None) -> int:
     }
     pipeline.discard_staged_delay()
 
+    # Multi-candidate comparison: register two drifting-clock explanations
+    # for the wheel sensor, filter the registry, then compare a saved
+    # selection side by side.  None of this adopts a candidate.
+    pipeline.register_anchor(
+        "wheel-endpoint-fix",
+        "rear_wheels",
+        0,
+        (10.0, 9.55),
+        arrival_time=messages[-1].observed_at(),
+    )
+    pipeline.register_interpretation(
+        "wheel-drift-slow",
+        "rear_wheels",
+        boundaries=[],
+        anchors={0: [(0.0, -TRUE_DELAYS["rear_wheels"]), (10.0, 9.55)]},
+        anchor_ids=("wheel-endpoint-fix",),
+        note="端点锚点 + 缓慢漂移假设",
+    )
+    pipeline.register_interpretation(
+        "wheel-drift-fast",
+        "rear_wheels",
+        boundaries=[],
+        anchors={0: [(0.0, -TRUE_DELAYS["rear_wheels"]), (10.0, 9.45)]},
+        note="同样端点、更快漂移假设",
+    )
+    pipeline.set_candidate_filter(CandidateFilter(statuses=("pending",)))
+    filtered_candidates = [
+        entry.name for entry in pipeline.filtered_interpretations()
+    ]
+    candidate_comparison = pipeline.select_for_comparison(
+        ["wheel-drift-slow", "wheel-drift-fast"], conflicts_only=True
+    )
+    (args.output_dir / "candidate_comparison.json").write_text(
+        json.dumps(candidate_comparison.as_dict(), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
     rows = []
     for point in truth:
         state = _state_at(pipeline, point.time)
@@ -132,6 +170,10 @@ def main(argv: list[str] | None = None) -> int:
             else None
         ),
         staged_sensor=checkpoint.staged_sensor,
+        anchor_records=list(pipeline.anchor_records.values()),
+        pending_interpretations=list(pipeline.interpretations.values()),
+        candidate_filter=pipeline.candidate_filter,
+        comparison_selection=pipeline.comparison_selection,
     )
 
     # Restore must present exactly the same visible data boundary: a message
@@ -152,10 +194,30 @@ def main(argv: list[str] | None = None) -> int:
             else None
         ),
         staged_sensor=metadata["staged_sensor"],
+        anchor_records=metadata["anchor_records"],
+        pending_interpretations=metadata["pending_interpretations"],
+        candidate_filter=CandidateFilter.from_dict(metadata["candidate_filter"]),
+        comparison_selection=metadata["comparison_selection"],
     )
     restored = LocalizationPipeline()
     restored.restore_checkpoint(loaded_checkpoint)
     boundary_after = restored.visible_data_boundary()
+    resumed_comparison = restored.compare_selected()
+    pre_save_times = {
+        (item.sensor, item.sequence): dict(item.corrected_times)
+        for item in candidate_comparison.time_conflicts
+    }
+    resumed_consistent = all(
+        (item.sensor, item.sequence) in pre_save_times
+        and all(
+            abs(
+                pre_save_times[(item.sensor, item.sequence)][name] - time
+            )
+            < 1e-9
+            for name, time in item.corrected_times
+        )
+        for item in resumed_comparison.time_conflicts
+    )
 
     metrics = _metrics(rows, pipeline)
     raw_rows = [row for row in rows if row["raw_position_error"] != ""]
@@ -175,6 +237,24 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
     metrics["restored_staged_sensor"] = restored.staged_sensor
+    metrics["candidate_filter"] = (
+        pipeline.candidate_filter.as_dict() if pipeline.candidate_filter else None
+    )
+    metrics["filtered_candidates"] = filtered_candidates
+    metrics["candidate_comparison"] = {
+        "selection": pipeline.comparison_selection.as_dict(),
+        "counts": candidate_comparison.counts(),
+        "exported_to": "candidate_comparison.json",
+    }
+    metrics["restored_comparison_selection"] = (
+        restored.comparison_selection.as_dict()
+        if restored.comparison_selection
+        else None
+    )
+    metrics["restore_preserves_comparison"] = (
+        resumed_comparison.names == candidate_comparison.names
+        and resumed_consistent
+    )
     (args.output_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8"
     )

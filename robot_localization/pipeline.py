@@ -4,6 +4,14 @@ from dataclasses import dataclass, field, fields
 from dataclasses import replace
 
 from .calibration import DelayCalibration, SensorClockModel
+from .candidate_compare import (
+    CandidateComparison,
+    CandidateFilter,
+    CandidateSummary,
+    ComparisonSelection,
+    ObservationAlignment,
+    TIME_TOLERANCE,
+)
 from .estimator import LocalizationEstimator, StateEstimate
 from .interpretations import AnchorRecord, AnchorRetraction, Interpretation
 from .segments import (
@@ -30,8 +38,8 @@ class Checkpoint:
     staged_sensor: str | None = None
     anchor_records: list = field(default_factory=list)
     pending_interpretations: list = field(default_factory=list)
-    anchor_records: list = field(default_factory=list)
-    pending_interpretations: list = field(default_factory=list)
+    candidate_filter: CandidateFilter | None = None
+    comparison_selection: ComparisonSelection | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +215,8 @@ class LocalizationPipeline:
         self.anchor_records: dict[str, AnchorRecord] = {}
         self.interpretations: dict[str, Interpretation] = {}
         self.interpretation_comparisons: dict[str, DelayComparison] = {}
+        self.candidate_filter: CandidateFilter | None = None
+        self.comparison_selection: ComparisonSelection | None = None
 
     # ------------------------------------------------------------------ ingest
 
@@ -254,6 +264,8 @@ class LocalizationPipeline:
                 self.staged_sensor,
                 list(self.anchor_records.values()),
                 list(self.interpretations.values()),
+                self.candidate_filter,
+                self.comparison_selection,
             )
         )
         return list(self.outputs)
@@ -304,6 +316,8 @@ class LocalizationPipeline:
                 self.staged_sensor,
                 list(self.anchor_records.values()),
                 list(self.interpretations.values()),
+                self.candidate_filter,
+                self.comparison_selection,
             )
         )
         return list(self.sealed_outputs)
@@ -675,6 +689,230 @@ class LocalizationPipeline:
         self.interpretations[name] = replace(interp, status="adopted")
         return report
 
+    # ------------------------------------- candidate filtering and compare
+
+    def set_candidate_filter(
+        self, candidate_filter: CandidateFilter | dict | None
+    ) -> CandidateFilter | None:
+        """Store a reusable registry filter; saved with the checkpoint."""
+        if isinstance(candidate_filter, dict):
+            candidate_filter = CandidateFilter.from_dict(candidate_filter)
+        self.candidate_filter = candidate_filter
+        return self.candidate_filter
+
+    def filtered_interpretations(
+        self,
+        candidate_filter: CandidateFilter | None = None,
+        sensor: str | None = None,
+    ) -> tuple[InterpretationComparisonEntry, ...]:
+        """List registered candidates passing the stored or given filter.
+
+        Filtering only narrows the listing; every candidate stays
+        registered with its current status.
+        """
+        active = candidate_filter or self.candidate_filter
+        entries = self.compare_interpretations(sensor)
+        if active is None:
+            return entries
+        selected: list[InterpretationComparisonEntry] = []
+        for entry in entries:
+            interp = self.interpretations[entry.name]
+            covered = (
+                interp.adopted_sequences
+                if interp.adopted_sequences is not None
+                else tuple(
+                    decision.sequence for decision in entry.comparison.decisions
+                )
+            )
+            if active.matches(interp, covered):
+                selected.append(entry)
+        return tuple(selected)
+
+    def select_for_comparison(
+        self,
+        names,
+        *,
+        conflicts_only: bool = False,
+    ) -> CandidateComparison:
+        """Choose two or more candidates, save the choice and compare them.
+
+        The selection is stored so a checkpoint can resume the same
+        side-by-side view; comparing never adopts anything.
+        """
+        selection = ComparisonSelection(tuple(names), bool(conflicts_only))
+        comparison = self.compare_candidates(
+            selection.names, conflicts_only=selection.conflicts_only
+        )
+        self.comparison_selection = selection
+        return comparison
+
+    def compare_selected(self) -> CandidateComparison:
+        """Re-run the saved selection (e.g. after restoring a checkpoint)."""
+        if self.comparison_selection is None:
+            raise RuntimeError("no comparison selection saved")
+        return self.compare_candidates(
+            self.comparison_selection.names,
+            conflicts_only=self.comparison_selection.conflicts_only,
+        )
+
+    def compare_candidates(
+        self,
+        names,
+        *,
+        conflicts_only: bool = False,
+    ) -> CandidateComparison:
+        """Align two or more registered candidates on shared observations.
+
+        This is a pure read-only view: the live calibration, the registry
+        statuses, raw observation stamps and published outputs are all
+        left untouched.
+        """
+        names = tuple(names)
+        if len(names) < 2:
+            raise ValueError("compare at least two interpretation candidates")
+        interps = [self._require_interpretation(name) for name in names]
+        sensors = {interp.sensor for interp in interps}
+        if len(sensors) != 1:
+            raise ValueError(
+                "candidates for different sensors cannot be compared side by side"
+            )
+        sensor = sensors.pop()
+        # Refresh pending comparisons against the live calibration.
+        self.compare_interpretations(sensor)
+        summaries = tuple(
+            self._candidate_summary(interp) for interp in interps
+        )
+        decisions_by_name: dict[str, dict[tuple[str, int], ObservationDecision]] = {}
+        for interp in interps:
+            comparison = self.interpretation_comparisons[interp.name]
+            decisions_by_name[interp.name] = {
+                (decision.sensor, decision.sequence): decision
+                for decision in comparison.decisions
+            }
+        shared = set(decisions_by_name[names[0]])
+        for name in names[1:]:
+            shared &= set(decisions_by_name[name])
+        conflicts: list[ObservationAlignment] = []
+        same_basis_diff: list[ObservationAlignment] = []
+        identical: list[ObservationAlignment] = []
+        for key in sorted(shared):
+            times = tuple(
+                (name, decisions_by_name[name][key].corrected_time) for name in names
+            )
+            basis = tuple(
+                (name, self._basis_key(interp, key[1]))
+                for name, interp in zip(names, interps, strict=True)
+            )
+            values = [time for _, time in times]
+            same_time = max(values) - min(values) <= TIME_TOLERANCE
+            same_basis = len({key for _, key in basis}) == 1
+            if not same_time:
+                category = "time_conflict"
+            elif not same_basis:
+                category = "same_time_different_basis"
+            else:
+                category = "identical"
+            alignment = ObservationAlignment(
+                key[0],
+                key[1],
+                decisions_by_name[names[0]][key].stamp,
+                times,
+                basis,
+                category,
+            )
+            if category == "time_conflict":
+                conflicts.append(alignment)
+            elif category == "same_time_different_basis":
+                same_basis_diff.append(alignment)
+            else:
+                identical.append(alignment)
+        return CandidateComparison(
+            sensor,
+            summaries,
+            tuple(conflicts),
+            tuple(same_basis_diff),
+            tuple(identical),
+            bool(conflicts_only),
+        )
+
+    def _candidate_summary(self, interp: Interpretation) -> CandidateSummary:
+        clock = interp.clock
+        if isinstance(clock, PartialAdoptionClock):
+            clock = clock.candidate
+        drift_assumptions: list[dict[str, object]] = []
+        for segment in clock.segments:
+            anchors = segment.anchors
+            if not anchors:
+                drift_assumptions.append(
+                    {
+                        "segment_index": segment.index,
+                        "anchor_count": 0,
+                        "offset": None,
+                        "drift_rate": None,
+                        "status": "uncalibrated",
+                    }
+                )
+                continue
+            if len(anchors) == 1:
+                drift_rate = 0.0
+                status = "single_anchor"
+            else:
+                span = anchors[-1].stamp - anchors[0].stamp
+                drift_rate = (
+                    0.0
+                    if span == 0.0
+                    else (anchors[-1].offset - anchors[0].offset) / span
+                )
+                status = "calibrated"
+            drift_assumptions.append(
+                {
+                    "segment_index": segment.index,
+                    "anchor_count": len(anchors),
+                    "offset": anchors[0].offset,
+                    "drift_rate": drift_rate,
+                    "status": status,
+                }
+            )
+        anchor_basis: list[dict[str, object]] = []
+        for anchor_id in interp.anchor_ids:
+            record = self.anchor_records.get(anchor_id)
+            if record is None:
+                anchor_basis.append(
+                    {"anchor_id": anchor_id, "missing": "锚点已被撤回，仅保留名称追溯"}
+                )
+            else:
+                anchor_basis.append(record.as_dict())
+        return CandidateSummary(
+            interp.name,
+            interp.sensor,
+            interp.status,
+            interp.note,
+            tuple(drift_assumptions),
+            tuple(anchor_basis),
+        )
+
+    @staticmethod
+    def _basis_key(interp: Interpretation, sequence: int) -> tuple:
+        """Anchor basis deciding one observation's corrected time."""
+        clock = interp.clock
+        adopted = None
+        if isinstance(clock, PartialAdoptionClock):
+            adopted = sequence in clock.adopted_sequences
+            clock = clock.candidate if adopted else clock.base
+        if isinstance(clock, SegmentedSensorClock):
+            segment = clock.segment_for(sequence)
+            signature = tuple(
+                (anchor.stamp, anchor.corrected_time, anchor.uncertainty)
+                for anchor in segment.anchors
+            )
+            return ("segment", segment.index, signature, adopted)
+        if isinstance(clock, SensorClockModel):
+            signature = tuple(
+                (anchor.stamp, anchor.corrected_time) for anchor in clock.anchors
+            )
+            return ("clock", signature, adopted)
+        return ("unknown", repr(clock), adopted)
+
     def discard_interpretation(self, name: str) -> None:
         """Withdraw a pending candidate explicitly; others are unaffected."""
         interp = self._require_interpretation(name)
@@ -787,6 +1025,8 @@ class LocalizationPipeline:
             self.staged_sensor,
             list(self.anchor_records.values()),
             list(self.interpretations.values()),
+            self.candidate_filter,
+            self.comparison_selection,
         )
         self.checkpoints.append(checkpoint)
         return checkpoint
@@ -855,6 +1095,14 @@ class LocalizationPipeline:
                 self.calibration,
                 self.calibration.with_reboot_clock(interp.clock),
             )
+        candidate_filter = getattr(checkpoint, "candidate_filter", None)
+        if isinstance(candidate_filter, dict):
+            candidate_filter = CandidateFilter.from_dict(candidate_filter)
+        self.candidate_filter = candidate_filter
+        selection = getattr(checkpoint, "comparison_selection", None)
+        if isinstance(selection, dict):
+            selection = ComparisonSelection.from_dict(selection)
+        self.comparison_selection = selection
 
     def replay(self) -> list[StateEstimate]:
         if self.arrival_horizon is None:
@@ -1284,6 +1532,8 @@ class LocalizationPipeline:
                     self.staged_sensor,
                     list(self.anchor_records.values()),
                     list(self.interpretations.values()),
+                    self.candidate_filter,
+                    self.comparison_selection,
                 )
             )
 

@@ -14,6 +14,7 @@ python -m robot_localization.cli --output-dir outputs
 - `trajectory.csv`：位置、朝向、误差、95% 误差半径和降级原因。
 - `metrics.json`：已知路径的汇总误差。
 - `checkpoint.json`：示例中途检查点。
+- `candidate_comparison.json`：当前选中的多候选并排比较结果。
 
 ## 因果与迟到
 
@@ -54,6 +55,15 @@ python -m robot_localization.cli --output-dir outputs
 在重置两侧出现相同原始时间后补入迟到锚点时，`register_late_anchor(anchor_id, sensor, segment_index, anchor, applies_to=(lo, hi))` 生成只采用部分观测的新解释（`PartialAdoptionClock`）：序号落在 `applies_to` 内的观测按新解释校正，其余观测维持原版本。锚点先经 `register_anchor` 登记来源与到达时间；`retract_anchor(anchor_id)` 撤回锚点时返回 `AnchorRetraction`，列出所有依赖它的解释并把它们标记为 `anchor_retracted`（保留可追溯，不可再采用），无关候选不受影响。
 
 未决候选随检查点保存（`anchor_records` 与 `pending_interpretations`），重开后恢复同一登记表并重新计算比较，范围与下游采用依据仍可追溯；`tests/test_interpretations.py` 覆盖多解释比较、显式采用、迟到锚点部分采用、锚点撤回依赖清单以及保存恢复。
+
+## 多候选对比与筛选
+
+登记表中的候选可以按条件筛选后再并排比较，整个过程是只读视图：不采用候选、不修改观测原始 `time`、不改写已发布版本。
+
+- `set_candidate_filter(CandidateFilter(...))` 保存一套筛选条件，`filtered_interpretations()` 按 `sequence_range`（候选覆盖的观测序号范围）、`anchor_ids`（依赖的锚点来源）和 `statuses`（`pending` / `adopted` / `anchor_retracted`）过滤登记表；不传条件时默认使用已保存的筛选。
+- `select_for_comparison(names, conflicts_only=...)` 选择两份或多份同传感器候选并保存选择；`compare_candidates(...)` / `compare_selected()` 生成 `CandidateComparison`：每份候选列出各段漂移假设（锚点数、偏移、漂移率、单锚点/未校时状态）与锚点依据（来源、到达时间、适用范围），重叠观测逐身份对齐各候选的校正时间。
+- 重叠观测按三种情况分组：`time_conflicts`（校正时间不同，附时间差 `time_spread`）、`same_time_different_basis`（校正时间相同但段/锚点依据不同）、`identical`（完全一致）。`conflicts_only=True` 时导出只保留冲突观测，各组计数仍完整保留；`CandidateComparison.as_dict()` 即为可 JSON 导出的当前比较结果。
+- 筛选条件与比较选择随检查点保存（`candidate_filter`、`comparison_selection`），重开后 `compare_selected()` 继续同一套并排视图；`tests/test_candidate_compare.py` 覆盖三维筛选、三分组、仅冲突导出、只读性、选择校验以及保存恢复。
 
 默认示例同时运行零延迟（未校正）基线与时钟校正运行，`metrics.json` 输出两者的位置 RMSE、95% 半径覆盖率、已发布重算记录、两套时钟解释的逐身份并排比较、未发布校时的撤销记录、开放区间不确定空窗以及恢复前后的可见边界；`trajectory.csv` 增加 `raw_position_error` 与 `sealed` 列。
 

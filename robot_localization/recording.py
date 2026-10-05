@@ -50,6 +50,8 @@ class CheckpointStore:
         staged_sensor: str | None = None,
         anchor_records: list | None = None,
         pending_interpretations: list | None = None,
+        candidate_filter: dict[str, object] | None = None,
+        comparison_selection: dict[str, object] | None = None,
     ) -> None:
         payload = {
             "time": estimate.time,
@@ -83,6 +85,16 @@ class CheckpointStore:
                 item.as_dict() if hasattr(item, "as_dict") else item
                 for item in (pending_interpretations or [])
             ],
+            "candidate_filter": (
+                candidate_filter.as_dict()
+                if hasattr(candidate_filter, "as_dict")
+                else candidate_filter
+            ),
+            "comparison_selection": (
+                comparison_selection.as_dict()
+                if hasattr(comparison_selection, "as_dict")
+                else comparison_selection
+            ),
             "sealed_outputs": [
                 serialize_state(item)
                 for item in (sealed_outputs or [])
@@ -137,6 +149,8 @@ class CheckpointStore:
             "staged_sensor": payload.get("staged_sensor"),
             "anchor_records": payload.get("anchor_records", []),
             "pending_interpretations": payload.get("pending_interpretations", []),
+            "candidate_filter": payload.get("candidate_filter"),
+            "comparison_selection": payload.get("comparison_selection"),
         }
         return estimate, observations, metadata
 

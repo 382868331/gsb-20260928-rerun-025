@@ -53,6 +53,10 @@ python -m robot_localization.cli --output-dir outputs
 
 在重置两侧出现相同原始时间后补入迟到锚点时，`register_late_anchor(anchor_id, sensor, segment_index, anchor, applies_to=(lo, hi))` 生成只采用部分观测的新解释（`PartialAdoptionClock`）：序号落在 `applies_to` 内的观测按新解释校正，其余观测维持原版本。锚点先经 `register_anchor` 登记来源与到达时间；`retract_anchor(anchor_id)` 撤回锚点时返回 `AnchorRetraction`，列出所有依赖它的解释并把它们标记为 `anchor_retracted`（保留可追溯，不可再采用），无关候选不受影响。
 
+需要跨候选拼接时，调用 `register_segmented_combination(name, sensor, [(candidate, first_sequence, last_sequence), ...])`。组合单位是原始观测的闭区间序号而不是屏幕上接近的时间：每个区间显式记录候选名称、首末观测身份和锚点依赖，生成独立的 `segmented_combination` 候选；区间外保留当时已发布校时或未知状态，不静默采用新候选。系统会核对同一候选区间内校正时间的接收序号单调性、组合边界两侧的具体观测身份与时间先后、重启断点是否由两侧共同记录、断点确认状态/窗口是否一致，以及共同锚点映射是否一致。矛盾写入候选的结构化 `reboot_contradictions`，包含具体序号区间、身份、来源候选和数值依据；有矛盾的候选保持未决但不能采用，也不会做平滑拼接。
+
+`compare_combination_order_effects(name)` 对全部可见传感器计算采用组合前后的跨传感器前后关系变化，逐条列出身份、旧/新校正时间以及关系反转，便于同时保留多个未确认组合比较事件影响；只有 `adopt_interpretation(name)` 会明确发布其中一个。局部补锚调用 `supplement_combination_anchor(combination, anchor_id, ..., applies_to=(lo, hi))`，它不改写原组合，而是登记锚点并产生 `原名称:anchor_id` 新版本；复核只覆盖指定区间及其相邻组合边界，其他区间已经确认的依据原样保留。组合、冲突、锚点来源和未采用状态都随检查点保存，重开后仍对应当初的 `(sensor, sequence)` 观测身份。
+
 未决候选随检查点保存（`anchor_records` 与 `pending_interpretations`），重开后恢复同一登记表并重新计算比较，范围与下游采用依据仍可追溯；`tests/test_interpretations.py` 覆盖多解释比较、显式采用、迟到锚点部分采用、锚点撤回依赖清单以及保存恢复。
 
 ## 多候选对比与筛选

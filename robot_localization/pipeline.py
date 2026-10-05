@@ -15,6 +15,8 @@ from .comparison import (
 from .estimator import LocalizationEstimator, StateEstimate
 from .interpretations import AnchorRecord, AnchorRetraction, Interpretation
 from .segments import (
+    CombinationRange,
+    CompositeSegmentClock,
     PartialAdoptionClock,
     RebootBoundary,
     SegmentAnchor,
@@ -163,6 +165,31 @@ class UncertainInterval:
     start: float
     end: float
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CrossSensorOrderEffect:
+    identity: tuple[str, int]
+    stamp: float
+    baseline_time: float
+    combination_time: float
+    baseline_predecessors: tuple[tuple[str, int], ...]
+    combination_predecessors: tuple[tuple[str, int], ...]
+    changed_relations: tuple[tuple[str, int, str], ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "identity": list(self.identity),
+            "stamp": self.stamp,
+            "baseline_time": self.baseline_time,
+            "combination_time": self.combination_time,
+            "baseline_predecessors": [list(item) for item in self.baseline_predecessors],
+            "combination_predecessors": [list(item) for item in self.combination_predecessors],
+            "changed_relations": [
+                {"identity": list(identity), "relation": relation}
+                for identity, relation in self.changed_relations
+            ],
+        }
 
 
 class SealedHistoryError(RuntimeError):
@@ -852,7 +879,25 @@ class LocalizationPipeline:
             clock.candidate if isinstance(clock, PartialAdoptionClock) else clock
         )
         drift_assumptions: list[dict[str, object]] = []
-        if isinstance(inner, SegmentedSensorClock):
+        if isinstance(inner, CompositeSegmentClock):
+            for covered in inner.ranges:
+                drift_assumptions.append(
+                    {
+                        "segment_index": None,
+                        "calibrated": True,
+                        "single_anchor": False,
+                        "anchor_count": len(covered.anchor_ids),
+                        "offsets": [],
+                        "implied_drift": 0.0,
+                        "source_name": covered.source_name,
+                        "sequence_range": [
+                            covered.first_sequence,
+                            covered.last_sequence,
+                        ],
+                        "conflict_count": len(inner.conflicts),
+                    }
+                )
+        elif isinstance(inner, SegmentedSensorClock):
             for segment in inner.segments:
                 offsets = [anchor.offset for anchor in segment.anchors]
                 if len(segment.anchors) >= 2:
@@ -913,6 +958,14 @@ class LocalizationPipeline:
         else:
             inner = clock
             prefix = "full"
+        if isinstance(clock, CompositeSegmentClock):
+            covered = clock.range_for(sequence)
+            if covered is None:
+                return f"unknown|range|{sequence}"
+            return (
+                f"combination|{covered.source_name}|sequences:"
+                f"{covered.first_sequence}-{covered.last_sequence}"
+            )
         if isinstance(inner, SegmentedSensorClock):
             segment = inner.segment_for(sequence)
             anchors = ",".join(
@@ -922,6 +975,436 @@ class LocalizationPipeline:
             return f"{prefix}|segment:{segment.index}|{anchors}"
         return f"{prefix}|model|{inner.as_dict()!r}"
 
+    def register_segmented_combination(
+        self,
+        name: str,
+        sensor: str,
+        selections: list[tuple[str, int, int]],
+        *,
+        note: str = "",
+    ) -> DelayComparison:
+        """Build one independent candidate from raw inclusive sequence ranges."""
+        selections = [
+            (str(candidate), int(first), int(last))
+            for candidate, first, last in selections
+        ]
+        if not selections:
+            raise ValueError("segmented combination needs at least one range")
+        selections.sort(key=lambda item: item[1])
+        if any(last < first for _, first, last in selections):
+            raise ValueError("combination ranges must include at least one sequence")
+        for left, right in zip(selections, selections[1:], strict=False):
+            if right[1] <= left[2]:
+                raise ValueError("combination ranges must be disjoint and ordered")
+        ranges: list[CombinationRange] = []
+        anchor_ids: list[str] = []
+        for candidate_name, first, last in selections:
+            interp = self._require_interpretation(candidate_name)
+            if interp.sensor != sensor:
+                raise ValueError(
+                    f"range source {candidate_name!r} explains {interp.sensor!r}, not {sensor!r}"
+                )
+            if interp.status != "pending":
+                raise ValueError(
+                    f"range source {candidate_name!r} is {interp.status}; only pending evidence can combine"
+                )
+            ranges.append(
+                CombinationRange(
+                    candidate_name,
+                    first,
+                    last,
+                    interp.clock,
+                    interp.anchor_ids,
+                )
+            )
+            anchor_ids.extend(interp.anchor_ids)
+        fallback = self.calibration.reboot_clock_for(sensor)
+        if fallback is None:
+            fallback = self.calibration.clock_for(sensor)
+        initial = CompositeSegmentClock(sensor, fallback, tuple(ranges))
+        observations = sorted(
+            (item for item in self.received if item.sensor == sensor),
+            key=lambda item: item.sequence,
+        )
+        conflicts = self._combination_conflicts(initial, observations)
+        clock = CompositeSegmentClock(
+            sensor, fallback, tuple(ranges), tuple(conflicts)
+        )
+        combined_note = note or "按原始观测序号范围组合；每个边界保留候选来源，不按显示时间合并"
+        return self._register_interpretation(
+            name,
+            sensor,
+            clock,
+            anchor_ids=tuple(dict.fromkeys(anchor_ids)),
+            applies_to=None,
+            note=combined_note,
+        )
+
+    def supplement_combination_anchor(
+        self,
+        combination_name: str,
+        anchor_id: str,
+        segment_index: int,
+        anchor,
+        *,
+        applies_to: tuple[int, int],
+        arrival_time: float | None = None,
+        source: str = "",
+        note: str = "",
+    ) -> DelayComparison:
+        """Create a new combination version by updating one covered range only."""
+        interp = self._require_interpretation(combination_name)
+        clock = interp.clock
+        if not isinstance(clock, CompositeSegmentClock):
+            raise ValueError(f"{combination_name!r} is not a segmented combination")
+        low, high = int(applies_to[0]), int(applies_to[1])
+        covered = clock.range_for(low)
+        if covered is None or covered != clock.range_for(high):
+            raise ValueError("supplemented anchor range must stay inside one combination range")
+        self.register_anchor(
+            anchor_id,
+            interp.sensor,
+            segment_index,
+            anchor,
+            arrival_time=arrival_time,
+            applies_to=(low, high),
+            source=source,
+        )
+        parsed = (
+            anchor
+            if isinstance(anchor, SegmentAnchor)
+            else SegmentAnchor(*(float(value) for value in anchor))
+        )
+        source_clock = covered.clock
+        inner = source_clock.candidate if isinstance(source_clock, PartialAdoptionClock) else source_clock
+        if not isinstance(inner, SegmentedSensorClock):
+            raise ValueError("supplemented anchor requires a reboot-segment source clock")
+        segment = inner.segments[segment_index]
+        merged = tuple(sorted([*segment.anchors, parsed], key=lambda item: item.stamp))
+        updated_source = inner.replacing(
+            {segment_index: SegmentClock(segment_index, merged)}
+        )
+        if isinstance(source_clock, PartialAdoptionClock):
+            updated_source = PartialAdoptionClock(
+                source_clock.sensor,
+                source_clock.base,
+                updated_source,
+                source_clock.adopted_sequences,
+            )
+        retained_conflicts = tuple(
+            item
+            for item in clock.conflicts
+            if not self._conflict_touches_range(item, covered)
+        )
+        replacement = CombinationRange(
+            covered.source_name,
+            covered.first_sequence,
+            covered.last_sequence,
+            updated_source,
+            tuple(dict.fromkeys((*covered.anchor_ids, anchor_id))),
+        )
+        partial = clock.replacing_range_clock(
+            covered.first_sequence, covered.last_sequence, updated_source
+        )
+        partial = CompositeSegmentClock(
+            clock.sensor,
+            clock.fallback,
+            tuple(
+                replacement if item == covered else item for item in clock.ranges
+            ),
+            retained_conflicts,
+        )
+        observations = sorted(
+            (
+                item
+                for item in self.received
+                if interp.sensor == item.sensor
+                and covered.first_sequence - 1
+                <= item.sequence
+                <= covered.last_sequence + 1
+            ),
+            key=lambda item: item.sequence,
+        )
+        new_conflicts = self._combination_conflicts(
+            partial,
+            observations,
+            review_range=(covered.first_sequence, covered.last_sequence),
+        )
+        conflicts = tuple((*retained_conflicts, *new_conflicts))
+        versioned = CompositeSegmentClock(
+            clock.sensor, clock.fallback, partial.ranges, tuple(conflicts)
+        )
+        versioned_note = note or (
+            f"{interp.note}；局部锚点 {anchor_id} 生成新版本，仅复核范围 {applies_to}"
+        )
+        versioned_interp = replace(
+            interp,
+            name=f"{combination_name}:{anchor_id}",
+            clock=versioned,
+            anchor_ids=tuple(dict.fromkeys((*interp.anchor_ids, anchor_id))),
+            note=versioned_note,
+        )
+        self.interpretations[versioned_interp.name] = versioned_interp
+        comparison = self.compare_calibrations(
+            interp.sensor, self.calibration, self.calibration.with_reboot_clock(versioned)
+        )
+        self.interpretation_comparisons[versioned_interp.name] = comparison
+        return comparison
+
+    def compare_combination_order_effects(
+        self, name: str
+    ) -> tuple[CrossSensorOrderEffect, ...]:
+        """Show changes in before/after relations across all visible sensors."""
+        interp = self._require_interpretation(name)
+        candidate_calibration = self.calibration.with_reboot_clock(interp.clock)
+        visible = self._visible(self.arrival_horizon)
+        baseline_events = sorted(
+            visible, key=lambda item: self._sort_key(item, self.calibration)
+        )
+        candidate_events = sorted(
+            visible, key=lambda item: self._sort_key(item, candidate_calibration)
+        )
+
+        def predecessors(events, calibration) -> dict[tuple[str, int], tuple[tuple[str, int], ...]]:
+            result = {}
+            prior: list[tuple[str, int]] = []
+            for item in events:
+                key = (item.sensor, item.sequence)
+                result[key] = tuple(prior)
+                prior.append(key)
+            return result
+
+        before = predecessors(baseline_events, self.calibration)
+        after = predecessors(candidate_events, candidate_calibration)
+        effects: list[CrossSensorOrderEffect] = []
+        changed_keys = set()
+        for key in before:
+            if key[0] == interp.sensor and before[key] != after[key]:
+                changed_keys.add(key)
+            other_changes = {
+                other
+                for other in before
+                if other[0] != interp.sensor
+                and ((other in before[key]) != (other in after[key]))
+            }
+            if other_changes:
+                changed_keys.add(key)
+                changed_keys.update(other_changes)
+        observations = {(item.sensor, item.sequence): item for item in visible}
+        for key in sorted(changed_keys):
+            observation = observations[key]
+            changed = []
+            for other in sorted(set(before[key]) | set(after[key])):
+                if (other in before[key]) != (other in after[key]):
+                    changed.append((other[0], other[1], "before→after" if other in after[key] else "after→before"))
+            effects.append(
+                CrossSensorOrderEffect(
+                    key,
+                    observation.time,
+                    self.calibration.corrected_time(observation),
+                    candidate_calibration.corrected_time(observation),
+                    before[key],
+                    after[key],
+                    tuple(changed),
+                )
+            )
+        return tuple(effects)
+
+    def _combination_conflicts(
+        self,
+        clock: CompositeSegmentClock,
+        observations: list[Observation],
+        *,
+        review_range: tuple[int, int] | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        conflicts: list[dict[str, object]] = []
+        for covered in clock.ranges:
+            if review_range is not None and (
+                (covered.first_sequence, covered.last_sequence) != review_range
+            ):
+                continue
+            for problem in covered.clock.contradictions():
+                conflicts.append(
+                    {
+                        **problem,
+                        "kind": "candidate_internal_contradiction",
+                        "source": covered.source_name,
+                        "source_range": [
+                            covered.first_sequence,
+                            covered.last_sequence,
+                        ],
+                    }
+                )
+        by_sequence = {item.sequence: item for item in observations}
+        for covered in clock.ranges:
+            if review_range is not None and (
+                (covered.first_sequence, covered.last_sequence) != review_range
+            ):
+                continue
+            items = [
+                by_sequence[sequence]
+                for sequence in range(covered.first_sequence, covered.last_sequence + 1)
+                if sequence in by_sequence
+            ]
+            for previous, current in zip(items, items[1:], strict=False):
+                previous_time = covered.clock.corrected_time_at(
+                    previous.sequence, previous.time
+                )
+                current_time = covered.clock.corrected_time_at(
+                    current.sequence, current.time
+                )
+                if current_time < previous_time - 1e-9:
+                    conflicts.append(
+                        {
+                            "kind": "non_monotonic_time",
+                            "source": covered.source_name,
+                            "sequence_range": [previous.sequence, current.sequence],
+                            "stamp_range": [previous.time, current.time],
+                            "corrected_range": [previous_time, current_time],
+                            "reason": "同一候选来源内校正时间随原始接收序号倒退",
+                        }
+                    )
+        for left, right in zip(clock.ranges, clock.ranges[1:], strict=False):
+            if review_range is not None and not (
+                (left.first_sequence, left.last_sequence) == review_range
+                or (right.first_sequence, right.last_sequence) == review_range
+            ):
+                continue
+            before_obs = by_sequence.get(left.last_sequence)
+            after_obs = by_sequence.get(right.first_sequence)
+            if before_obs is None or after_obs is None:
+                conflicts.append(
+                    {
+                        "kind": "unknown_boundary",
+                        "sources": [left.source_name, right.source_name],
+                        "sequence_range": [left.last_sequence, right.first_sequence],
+                        "reason": "组合边界缺少观测身份，区间继续未知",
+                    }
+                )
+                continue
+            before_time = left.clock.corrected_time_at(
+                before_obs.sequence, before_obs.time
+            )
+            after_time = right.clock.corrected_time_at(
+                after_obs.sequence, after_obs.time
+            )
+            if after_time < before_time - 1e-9:
+                conflicts.append(
+                    {
+                        "kind": "boundary_time_reversal",
+                        "sources": [left.source_name, right.source_name],
+                        "boundary_between_sequences": [left.last_sequence, right.first_sequence],
+                        "identities": [
+                            [before_obs.sensor, before_obs.sequence],
+                            [after_obs.sensor, after_obs.sequence],
+                        ],
+                        "corrected_times": [before_time, after_time],
+                        "reason": "不同来源范围的边界校正时间倒退；拒绝按显示时间相近合并",
+                    }
+                )
+            left_cuts = {
+                boundary.after_sequence: boundary
+                for boundary in self._clock_boundaries(left.clock)
+            }
+            right_cuts = {
+                boundary.after_sequence: boundary
+                for boundary in self._clock_boundaries(right.clock)
+            }
+            for cut in sorted(set(left_cuts) | set(right_cuts)):
+                if cut < left.first_sequence or cut >= right.last_sequence:
+                    continue
+                left_boundary = left_cuts.get(cut)
+                right_boundary = right_cuts.get(cut)
+                if left_boundary is None or right_boundary is None:
+                    conflicts.append(
+                        {
+                            "kind": "reboot_breakpoint_missing",
+                            "sources": [left.source_name, right.source_name],
+                            "after_sequence": cut,
+                            "reason": "重启断点只由组合边界一侧候选记录，不能跨来源静默继承",
+                        }
+                    )
+                elif left_boundary.confirmed != right_boundary.confirmed or (
+                    left_boundary.reset_window != right_boundary.reset_window
+                ):
+                    conflicts.append(
+                        {
+                            "kind": "reboot_breakpoint_conflict",
+                            "sources": [left.source_name, right.source_name],
+                            "after_sequence": cut,
+                            "boundaries": [left_boundary.as_dict(), right_boundary.as_dict()],
+                            "reason": "共同重启断点的确认状态或窗口来源不一致",
+                        }
+                    )
+        for covered in clock.ranges:
+            if review_range is not None and (
+                (covered.first_sequence, covered.last_sequence) != review_range
+            ):
+                continue
+            inner = covered.clock
+            if isinstance(inner, PartialAdoptionClock):
+                inner = inner.candidate
+            if not isinstance(inner, SegmentedSensorClock):
+                continue
+            for anchor_id in covered.anchor_ids:
+                record = self.anchor_records.get(anchor_id)
+                if record is None or not 0 <= record.segment_index < len(inner.segments):
+                    continue
+                matching = [
+                    anchor
+                    for anchor in inner.segments[record.segment_index].anchors
+                    if abs(anchor.stamp - record.anchor.stamp) <= TIME_TOLERANCE
+                ]
+                if not matching:
+                    conflicts.append(
+                        {
+                            "kind": "common_anchor_missing",
+                            "source": covered.source_name,
+                            "anchor_id": anchor_id,
+                            "segment_index": record.segment_index,
+                            "reason": "登记的共同锚点未覆盖该候选段，不能外推为已知",
+                        }
+                    )
+                    continue
+                anchor = matching[0]
+                if abs(anchor.corrected_time - record.anchor.corrected_time) > TIME_TOLERANCE or abs(anchor.uncertainty - record.anchor.uncertainty) > TIME_TOLERANCE:
+                    conflicts.append(
+                        {
+                            "kind": "common_anchor_conflict",
+                            "source": covered.source_name,
+                            "anchor_id": anchor_id,
+                            "segment_index": record.segment_index,
+                            "recorded_anchor": record.anchor.as_dict(),
+                            "candidate_anchor": anchor.as_dict(),
+                            "reason": "同一锚点在来源候选中的映射不一致",
+                        }
+                    )
+        return tuple(conflicts)
+
+    @staticmethod
+    def _clock_boundaries(clock) -> tuple[RebootBoundary, ...]:
+        inner = clock.candidate if isinstance(clock, PartialAdoptionClock) else clock
+        return getattr(inner, "boundaries", ()) or ()
+
+    @staticmethod
+    def _conflict_touches_range(conflict: dict[str, object], covered: CombinationRange) -> bool:
+        if conflict.get("source") == covered.source_name:
+            return True
+        sources = conflict.get("sources")
+        if isinstance(sources, (list, tuple)) and covered.source_name in sources:
+            return True
+        if conflict.get("source") == covered.source_name:
+            source_range = conflict.get("source_range")
+            if isinstance(source_range, (list, tuple)) and len(source_range) == 2:
+                return tuple(source_range) == (
+                    covered.first_sequence,
+                    covered.last_sequence,
+                )
+        span = conflict.get("sequence_range")
+        if isinstance(span, (list, tuple)) and len(span) == 2:
+            return covered.first_sequence <= int(span[1]) and int(span[0]) <= covered.last_sequence
+        return False
+
     def adopt_interpretation(self, name: str) -> RecomputeReport:
         """Explicitly publish one pending candidate; nothing adopts itself."""
         interp = self._require_interpretation(name)
@@ -929,6 +1412,10 @@ class LocalizationPipeline:
             raise RuntimeError(
                 f"interpretation {name!r} is {interp.status}; "
                 "only pending candidates can be adopted"
+            )
+        if hasattr(interp.clock, "conflicts") and interp.clock.conflicts:
+            raise ValueError(
+                f"interpretation {name!r} has unresolved clock conflicts; resolve or record a new version"
             )
         self.staged_calibration = self.calibration.with_reboot_clock(interp.clock)
         self.staged_sensor = interp.sensor
@@ -1450,6 +1937,8 @@ class LocalizationPipeline:
     ) -> tuple[SegmentView, ...]:
         model = calibration.reboot_clock_for(sensor)
         if model is None:
+            return ()
+        if isinstance(model, CompositeSegmentClock):
             return ()
         contradiction_pairs = {
             tuple(item["between_segments"]) for item in model.contradictions()

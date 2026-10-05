@@ -384,6 +384,157 @@ class PartialAdoptionClock:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class CombinationRange:
+    """An inclusive raw observation-sequence range taken from one candidate."""
+
+    source_name: str
+    first_sequence: int
+    last_sequence: int
+    clock: object
+    anchor_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.last_sequence < self.first_sequence:
+            raise ValueError("combination range must include at least one sequence")
+        object.__setattr__(self, "anchor_ids", tuple(self.anchor_ids))
+
+    def contains(self, sequence: int) -> bool:
+        return self.first_sequence <= sequence <= self.last_sequence
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "source_name": self.source_name,
+            "first_sequence": self.first_sequence,
+            "last_sequence": self.last_sequence,
+            "anchor_ids": list(self.anchor_ids),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CompositeSegmentClock:
+    """Independent calibration assembled from raw sequence ranges.
+
+    No range is merged because its displayed times happen to be close.  Each
+    observation is delegated to the explicitly named candidate covering its
+    sequence; uncovered observations remain uncalibrated/unknown.
+    """
+
+    sensor: str
+    fallback: object
+    ranges: tuple[CombinationRange, ...]
+    conflicts: tuple[dict[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "ranges", tuple(self.ranges))
+        ordered = sorted(self.ranges, key=lambda item: item.first_sequence)
+        if tuple(ordered) != self.ranges:
+            raise ValueError("combination ranges must be ordered by first sequence")
+        for left, right in zip(self.ranges, self.ranges[1:], strict=False):
+            if right.first_sequence <= left.last_sequence:
+                raise ValueError("combination ranges cannot overlap")
+        object.__setattr__(self, "conflicts", tuple(self.conflicts))
+
+    def range_for(self, sequence: int) -> CombinationRange | None:
+        for item in self.ranges:
+            if item.contains(sequence):
+                return item
+        return None
+
+    def clock_for_sequence(self, sequence: int) -> object | None:
+        covered = self.range_for(sequence)
+        return None if covered is None else covered.clock
+
+    def corrected_time_at(self, sequence: int, stamp: float) -> float:
+        clock = self.clock_for_sequence(sequence)
+        if clock is None:
+            return _base_corrected_time(self.fallback, sequence, stamp)
+        return clock.corrected_time_at(sequence, stamp)
+
+    def corrected_range(self, sequence: int, stamp: float) -> tuple[float, float]:
+        clock = self.clock_for_sequence(sequence)
+        if clock is None:
+            return _base_corrected_range(self.fallback, sequence, stamp)
+        return clock.corrected_range(sequence, stamp)
+
+    def offset_at(self, sequence: int, stamp: float) -> float:
+        return stamp - self.corrected_time_at(sequence, stamp)
+
+    @property
+    def segments(self) -> tuple[SegmentClock, ...]:
+        clocks = [item.clock for item in self.ranges]
+        if not clocks:
+            return ()
+        return max(clocks, key=lambda item: len(item.segments)).segments
+
+    @property
+    def boundaries(self) -> tuple[RebootBoundary, ...]:
+        clocks = [item.clock for item in self.ranges]
+        return max(clocks, key=lambda item: len(item.boundaries)).boundaries if clocks else ()
+
+    def segment_index_for(self, sequence: int) -> int | None:
+        clock = self.clock_for_sequence(sequence)
+        if clock is None and isinstance(self.fallback, SegmentedSensorClock):
+            return self.fallback.segment_index_for(sequence)
+        if clock is None:
+            return None
+        return clock.segment_index_for(sequence)
+
+    def boundary_after_segment(self, index: int) -> RebootBoundary | None:
+        if not 0 <= index < len(self.boundaries):
+            return None
+        return self.boundaries[index]
+
+    def contradictions(self) -> tuple[dict[str, object], ...]:
+        return self.conflicts
+
+    def replacing_range_clock(
+        self, first_sequence: int, last_sequence: int, clock: object
+    ) -> "CompositeSegmentClock":
+        ranges = tuple(
+            item
+            if not (item.first_sequence == first_sequence and item.last_sequence == last_sequence)
+            else CombinationRange(
+                item.source_name,
+                item.first_sequence,
+                item.last_sequence,
+                clock,
+                item.anchor_ids,
+            )
+            for item in self.ranges
+        )
+        return CompositeSegmentClock(self.sensor, self.fallback, ranges, self.conflicts)
+
+    def with_range(
+        self, item: CombinationRange, conflicts: tuple[dict[str, object], ...]
+    ) -> "CompositeSegmentClock":
+        kept = tuple(
+            old
+            for old in self.ranges
+            if not (old.first_sequence <= item.last_sequence and item.first_sequence <= old.last_sequence)
+        )
+        return CompositeSegmentClock(
+            self.sensor,
+            self.fallback,
+            tuple(sorted((*kept, item), key=lambda value: value.first_sequence)),
+            tuple((*self.conflicts, *conflicts)),
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "type": "segmented_combination",
+            "fallback": self.fallback.as_dict(),
+            "ranges": [
+                {
+                    **item.as_dict(),
+                    "clock": item.clock.as_dict(),
+                }
+                for item in self.ranges
+            ],
+            "conflicts": list(self.conflicts),
+        }
+
+
 def _base_corrected_time(base: object, sequence: int, stamp: float) -> float:
     if isinstance(base, SegmentedSensorClock):
         return base.corrected_time_at(sequence, stamp)

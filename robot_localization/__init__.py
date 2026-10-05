@@ -9,6 +9,7 @@ from .comparison import (
 from .estimator import LocalizationEstimator, StateEstimate
 from .interpretations import AnchorRecord, AnchorRetraction, Interpretation
 from .pipeline import (
+    CrossSensorOrderEffect,
     DelayComparison,
     DelaySettingView,
     InterpretationComparisonEntry,
@@ -22,6 +23,8 @@ from .pipeline import (
 )
 from .recording import CheckpointStore, JsonlMessageSource, JsonlRecorder
 from .segments import (
+    CombinationRange,
+    CompositeSegmentClock,
     PartialAdoptionClock,
     RebootBoundary,
     SegmentAnchor,
@@ -54,11 +57,14 @@ __all__ = [
     "TimelinePosition",
     "TimelinePositionChange",
     "UncertainInterval",
+    "CrossSensorOrderEffect",
     "RebootBoundary",
     "SegmentAnchor",
     "SegmentClock",
     "SegmentedSensorClock",
     "PartialAdoptionClock",
+    "CombinationRange",
+    "CompositeSegmentClock",
     "AnchorRecord",
     "AnchorRetraction",
     "Interpretation",

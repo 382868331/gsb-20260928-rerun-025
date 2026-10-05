@@ -129,6 +129,7 @@ class DelayCalibration:
             if isinstance(model, dict) and model.get("type") in (
                 REBOOT_CLOCK_TYPE,
                 "partial_adoption",
+                "segmented_combination",
             ):
                 continue
             if isinstance(model, SensorClockModel):
@@ -169,6 +170,8 @@ class DelayCalibration:
     @staticmethod
     def _reboot_from_dict_or_value(sensor: str, model: object):
         from .segments import (
+            CombinationRange,
+            CompositeSegmentClock,
             PartialAdoptionClock,
             RebootBoundary,
             SegmentAnchor,
@@ -178,6 +181,37 @@ class DelayCalibration:
 
         if isinstance(model, PartialAdoptionClock):
             return model
+        if isinstance(model, CompositeSegmentClock):
+            return model
+        if isinstance(model, dict) and model.get("type") == "segmented_combination":
+            fallback_payload = model["fallback"]
+            fallback = (
+                DelayCalibration._reboot_from_dict_or_value(sensor, fallback_payload)
+                if isinstance(fallback_payload, dict)
+                and fallback_payload.get("type") in (REBOOT_CLOCK_TYPE, "partial_adoption")
+                else DelayCalibration._model_from_dict(sensor, fallback_payload)
+            )
+            ranges = []
+            for item in model.get("ranges", ()):
+                clock_payload = item["clock"]
+                clock = DelayCalibration._reboot_from_dict_or_value(
+                    sensor, clock_payload
+                )
+                ranges.append(
+                    CombinationRange(
+                        str(item["source_name"]),
+                        int(item["first_sequence"]),
+                        int(item["last_sequence"]),
+                        clock,
+                        tuple(str(anchor) for anchor in item.get("anchor_ids", ())),
+                    )
+                )
+            return CompositeSegmentClock(
+                sensor,
+                fallback,
+                tuple(ranges),
+                tuple(dict(item) for item in model.get("conflicts", ())),
+            )
         if isinstance(model, dict) and model.get("type") == "partial_adoption":
             base_payload = model["base"]
             if isinstance(base_payload, dict) and base_payload.get("type") == REBOOT_CLOCK_TYPE:

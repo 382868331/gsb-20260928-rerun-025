@@ -6,6 +6,15 @@ from .comparison import (
     InterpretationSetComparison,
     ObservationAlignment,
 )
+from .compositions import (
+    CompositionBoundary,
+    CompositionContradiction,
+    CompositionOrderingComparison,
+    CompositionPiece,
+    CompositionRecheck,
+    CompositeScheme,
+    OrderingChange,
+)
 from .estimator import LocalizationEstimator, StateEstimate
 from .interpretations import AnchorRecord, AnchorRetraction, Interpretation
 from .pipeline import (
@@ -66,4 +75,11 @@ __all__ = [
     "CandidateSummary",
     "InterpretationSetComparison",
     "ObservationAlignment",
+    "CompositionBoundary",
+    "CompositionContradiction",
+    "CompositionOrderingComparison",
+    "CompositionPiece",
+    "CompositionRecheck",
+    "CompositeScheme",
+    "OrderingChange",
 ]

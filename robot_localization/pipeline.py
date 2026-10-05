@@ -12,6 +12,15 @@ from .comparison import (
     InterpretationSetComparison,
     ObservationAlignment,
 )
+from .compositions import (
+    CompositionBoundary,
+    CompositionContradiction,
+    CompositionOrderingComparison,
+    CompositionPiece,
+    CompositionRecheck,
+    CompositeScheme,
+    OrderingChange,
+)
 from .estimator import LocalizationEstimator, StateEstimate
 from .interpretations import AnchorRecord, AnchorRetraction, Interpretation
 from .segments import (
@@ -39,6 +48,7 @@ class Checkpoint:
     anchor_records: list = field(default_factory=list)
     pending_interpretations: list = field(default_factory=list)
     comparison_view: dict | None = None
+    compositions: list = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +225,7 @@ class LocalizationPipeline:
         self.interpretations: dict[str, Interpretation] = {}
         self.interpretation_comparisons: dict[str, DelayComparison] = {}
         self.comparison_view: dict | None = None
+        self.compositions: dict[str, CompositeScheme] = {}
 
     # ------------------------------------------------------------------ ingest
 
@@ -263,6 +274,7 @@ class LocalizationPipeline:
                 list(self.anchor_records.values()),
                 list(self.interpretations.values()),
                 self.comparison_view,
+                list(self.compositions.values()),
             )
         )
         return list(self.outputs)
@@ -314,6 +326,7 @@ class LocalizationPipeline:
                 list(self.anchor_records.values()),
                 list(self.interpretations.values()),
                 self.comparison_view,
+                list(self.compositions.values()),
             )
         )
         return list(self.sealed_outputs)
@@ -1014,6 +1027,473 @@ class LocalizationPipeline:
             raise KeyError(f"unknown interpretation {name!r}")
         return self.interpretations[name]
 
+    # ------------------------------------------------- composite schemes
+
+    def compose_scheme(
+        self,
+        name: str,
+        sensor: str,
+        pieces,
+        *,
+        note: str = "",
+    ) -> CompositeScheme:
+        """Compose registered candidates into one piecewise scheme by range.
+
+        Each piece is `(interpretation_name, (low_sequence, high_sequence))`
+        (or a dict with `source`/`sequence_range`) and keeps the
+        provenance of the candidate it came from.  Boundaries between pieces
+        record both neighbouring sources; observations are never merged just
+        because their currently displayed corrected times look close.  The
+        scheme is only registered for comparison; nothing is published.
+        """
+        if name in self.compositions:
+            raise ValueError(
+                f"composition {name!r} already registered; "
+                "choose a new name instead of overriding it"
+            )
+        source_clocks: dict[str, SegmentedSensorClock] = {}
+        parsed: list[CompositionPiece] = []
+        for item in pieces:
+            if isinstance(item, dict):
+                source_name = str(item["source"])
+                seq_range = item["sequence_range"]
+            else:
+                source_name, seq_range = item[0], item[1]
+            source_name = str(source_name)
+            interp = self._require_interpretation(source_name)
+            if interp.sensor != sensor:
+                raise ValueError(
+                    f"interpretation {source_name!r} explains {interp.sensor!r}, "
+                    f"not {sensor!r}"
+                )
+            clock = interp.clock
+            if isinstance(clock, PartialAdoptionClock):
+                clock = clock.candidate
+            if not isinstance(clock, SegmentedSensorClock):
+                raise ValueError(
+                    "composition pieces require reboot-segment interpretations"
+                )
+            source_clocks[source_name] = clock
+            low, high = int(seq_range[0]), int(seq_range[1])
+            if high < low:
+                raise ValueError("piece sequence range must be ordered")
+            first_segment = clock.segment_index_for(low)
+            last_segment = clock.segment_index_for(high)
+            anchors: list[SegmentAnchor] = []
+            seen_stamps: set[float] = set()
+            for segment in clock.segments[first_segment : last_segment + 1]:
+                for anchor in segment.anchors:
+                    if anchor.stamp in seen_stamps:
+                        continue
+                    seen_stamps.add(anchor.stamp)
+                    anchors.append(anchor)
+            anchors.sort(key=lambda anchor: anchor.stamp)
+            anchor_ids: list[str] = []
+            for anchor_id in interp.anchor_ids:
+                record = self.anchor_records.get(anchor_id)
+                if record is None:
+                    continue
+                scope = record.applies_to
+                if scope is None or not (scope[1] < low or scope[0] > high):
+                    anchor_ids.append(anchor_id)
+            parsed.append(
+                CompositionPiece(
+                    len(parsed),
+                    source_name,
+                    (low, high),
+                    tuple(anchors),
+                    tuple(anchor_ids),
+                )
+            )
+        parsed.sort(key=lambda piece: piece.sequence_range)
+        parsed = [
+            replace(piece, index=index) for index, piece in enumerate(parsed)
+        ]
+        boundaries: list[CompositionBoundary] = []
+        for left, right in zip(parsed, parsed[1:]):
+            cut = left.sequence_range[1]
+            confirmed = False
+            window: tuple[float, float] | None = None
+            for piece in (left, right):
+                for boundary in source_clocks[piece.source].boundaries:
+                    if boundary.after_sequence != cut:
+                        continue
+                    confirmed = confirmed or boundary.confirmed
+                    if window is None:
+                        window = boundary.reset_window
+            boundaries.append(
+                CompositionBoundary(
+                    cut, left.source, right.source, confirmed, window
+                )
+            )
+        scheme = CompositeScheme(
+            name, sensor, tuple(parsed), tuple(boundaries), (), "pending", note
+        )
+        scheme = replace(
+            scheme, contradictions=self._composition_contradictions(scheme)
+        )
+        self.compositions[name] = scheme
+        return scheme
+
+    def _composition_contradictions(
+        self,
+        scheme: CompositeScheme,
+        piece_indices: set[int] | None = None,
+    ) -> tuple[CompositionContradiction, ...]:
+        """Check monotonicity, reboot breaks and shared anchors; never smooth."""
+        def wanted(index: int) -> bool:
+            return piece_indices is None or index in piece_indices
+
+        problems: list[CompositionContradiction] = []
+        pieces = scheme.pieces
+        for position, left in enumerate(pieces):
+            for right in pieces[position + 1 :]:
+                if not (wanted(left.index) or wanted(right.index)):
+                    continue
+                low = max(left.sequence_range[0], right.sequence_range[0])
+                high = min(left.sequence_range[1], right.sequence_range[1])
+                if low <= high:
+                    problems.append(
+                        CompositionContradiction(
+                            "range_overlap",
+                            (low, high),
+                            "两段组合范围在同一原始观测上重叠，同一观测不能同时属于两套解释",
+                            (
+                                {
+                                    "source": left.source,
+                                    "sequence_range": list(left.sequence_range),
+                                },
+                                {
+                                    "source": right.source,
+                                    "sequence_range": list(right.sequence_range),
+                                },
+                            ),
+                            (left.index, right.index),
+                        )
+                    )
+        visible = [
+            item
+            for item in self._visible(self.arrival_horizon)
+            if item.sensor == scheme.sensor
+        ]
+        for piece in pieces:
+            if not wanted(piece.index):
+                continue
+            low, high = piece.sequence_range
+            own = sorted(
+                (item for item in visible if low <= item.sequence <= high),
+                key=lambda item: item.sequence,
+            )
+            previous: Observation | None = None
+            for observation in own:
+                if previous is not None and observation.time < previous.time - 1e-9:
+                    problems.append(
+                        CompositionContradiction(
+                            "non_monotonic_stamp",
+                            (previous.sequence, observation.sequence),
+                            "同一时钟段内原始戳记随序号倒退，段内可能存在未标出的重启断点",
+                            (
+                                {
+                                    "sequence": previous.sequence,
+                                    "stamp": previous.time,
+                                },
+                                {
+                                    "sequence": observation.sequence,
+                                    "stamp": observation.time,
+                                },
+                            ),
+                            (piece.index,),
+                        )
+                    )
+                previous = observation
+            if piece.anchors:
+                clock = SegmentClock(piece.index, piece.anchors)
+                previous_entry: tuple[Observation, float] | None = None
+                for observation in own:
+                    corrected = clock.corrected_time_at(observation.time)
+                    if (
+                        previous_entry is not None
+                        and corrected < previous_entry[1] - 1e-9
+                    ):
+                        problems.append(
+                            CompositionContradiction(
+                                "non_monotonic_corrected",
+                                (previous_entry[0].sequence, observation.sequence),
+                                "按该段锚点校正后的时间随序号倒退，锚点与观测顺序矛盾",
+                                (
+                                    {
+                                        "sequence": previous_entry[0].sequence,
+                                        "stamp": previous_entry[0].time,
+                                        "corrected_time": previous_entry[1],
+                                    },
+                                    {
+                                        "sequence": observation.sequence,
+                                        "stamp": observation.time,
+                                        "corrected_time": corrected,
+                                    },
+                                ),
+                                (piece.index,),
+                            )
+                        )
+                    previous_entry = (observation, corrected)
+            source_interp = self.interpretations.get(piece.source)
+            source_clock = (
+                None if source_interp is None else source_interp.clock
+            )
+            if isinstance(source_clock, PartialAdoptionClock):
+                source_clock = source_clock.candidate
+            if isinstance(source_clock, SegmentedSensorClock):
+                for boundary in source_clock.boundaries:
+                    if low <= boundary.after_sequence < high:
+                        problems.append(
+                            CompositionContradiction(
+                                "reboot_inside_piece",
+                                (boundary.after_sequence, boundary.after_sequence + 1),
+                                "来源候选在该范围内部记录了重启断点，组合段必须沿断点拆分而不能整段沿用",
+                                (
+                                    {
+                                        "source": piece.source,
+                                        "after_sequence": boundary.after_sequence,
+                                        "confirmed": boundary.confirmed,
+                                    },
+                                ),
+                                (piece.index,),
+                            )
+                        )
+        for boundary in scheme.boundaries:
+            left = scheme.piece_for_sequence(boundary.after_sequence)
+            right = scheme.piece_for_sequence(boundary.after_sequence + 1)
+            if left is None or right is None:
+                continue
+            if not (wanted(left.index) or wanted(right.index)):
+                continue
+            if boundary.confirmed:
+                continue
+            for left_anchor in left.anchors:
+                for right_anchor in right.anchors:
+                    if (
+                        abs(left_anchor.stamp - right_anchor.stamp) <= 1e-9
+                        and abs(left_anchor.corrected_time - right_anchor.corrected_time)
+                        > 1e-9
+                    ):
+                        problems.append(
+                            CompositionContradiction(
+                                "shared_anchor_conflict",
+                                (boundary.after_sequence, boundary.after_sequence + 1),
+                                "边界两侧来源对同一原始戳记给出不同校正时间，且该边界没有确认的重启记录",
+                                (
+                                    {
+                                        "source": left.source,
+                                        "stamp": left_anchor.stamp,
+                                        "corrected_time": left_anchor.corrected_time,
+                                    },
+                                    {
+                                        "source": right.source,
+                                        "stamp": right_anchor.stamp,
+                                        "corrected_time": right_anchor.corrected_time,
+                                    },
+                                ),
+                                (left.index, right.index),
+                            )
+                        )
+        return tuple(problems)
+
+    def compare_composition_ordering(
+        self, names
+    ) -> CompositionOrderingComparison:
+        """Compare how pending schemes reorder cross-sensor event pairs.
+
+        Read-only: every scheme stays unconfirmed, raw observations and
+        published outputs are untouched.
+        """
+        names = tuple(str(name) for name in names)
+        if len(names) < 2:
+            raise ValueError("select at least two compositions to compare")
+        schemes = [self._require_composition(name) for name in names]
+        sensors = {scheme.sensor for scheme in schemes}
+        if len(sensors) != 1:
+            raise ValueError(
+                "compositions must explain the same sensor: "
+                + ", ".join(sorted(sensors))
+            )
+        sensor = schemes[0].sensor
+        visible = self._visible(self.arrival_horizon)
+        positions: dict[str, dict[tuple[str, int], int]] = {}
+        counts: dict[str, int] = {}
+        for scheme in schemes:
+            calibration = self.calibration.with_reboot_clock(scheme.as_clock())
+            ordered = sorted(
+                visible,
+                key=lambda item: (
+                    calibration.corrected_time(item),
+                    item.sensor,
+                    item.sequence,
+                ),
+            )
+            positions[scheme.name] = {
+                (item.sensor, item.sequence): index
+                for index, item in enumerate(ordered)
+            }
+            counts[scheme.name] = len(ordered)
+        own = [item for item in visible if item.sensor == sensor]
+        others = [item for item in visible if item.sensor != sensor]
+        changes: list[OrderingChange] = []
+        for first in own:
+            first_key = (first.sensor, first.sequence)
+            for second in others:
+                second_key = (second.sensor, second.sequence)
+                orders: list[tuple[str, str]] = []
+                distinct: set[str] = set()
+                for scheme in schemes:
+                    placement = positions[scheme.name]
+                    left = placement.get(first_key)
+                    right = placement.get(second_key)
+                    if left is None or right is None or left == right:
+                        sign = "same"
+                    elif left < right:
+                        sign = "before"
+                    else:
+                        sign = "after"
+                    orders.append((scheme.name, sign))
+                    distinct.add(sign)
+                if len(distinct) > 1:
+                    changes.append(OrderingChange(first_key, second_key, tuple(orders)))
+        return CompositionOrderingComparison(
+            names,
+            sensor,
+            tuple(changes),
+            tuple((name, counts[name]) for name in names),
+        )
+
+    def adopt_composition(self, name: str) -> RecomputeReport:
+        """Explicitly publish one pending scheme as a new version.
+
+        Adoption never rewrites the original receive order or any published
+        (sealed) result; other pending schemes stay available.  A scheme
+        with unresolved contradictions cannot be adopted: the conflicting
+        intervals and their evidence are reported instead of being smoothed.
+        """
+        scheme = self._require_composition(name)
+        if scheme.status != "pending":
+            raise RuntimeError(
+                f"composition {name!r} is {scheme.status}; "
+                "only pending schemes can be adopted"
+            )
+        if scheme.contradictions:
+            details = "; ".join(
+                f"[{item.sequence_interval[0]}, {item.sequence_interval[1]}] "
+                f"{item.kind}: {item.reason}"
+                for item in scheme.contradictions
+            )
+            raise RuntimeError(
+                f"composition {name!r} has unresolved contradictions: {details}"
+            )
+        self.staged_calibration = self.calibration.with_reboot_clock(
+            scheme.as_clock()
+        )
+        self.staged_sensor = scheme.sensor
+        self.staged_comparison = self.compare_calibrations(
+            scheme.sensor, self.calibration, self.staged_calibration
+        )
+        report = self.publish_staged_delay()
+        self.compositions[name] = replace(scheme, status="adopted")
+        return report
+
+    def discard_composition(self, name: str) -> None:
+        """Withdraw a pending scheme explicitly; others are unaffected."""
+        scheme = self._require_composition(name)
+        if scheme.status != "pending":
+            raise RuntimeError(
+                f"composition {name!r} is {scheme.status}; cannot discard"
+            )
+        del self.compositions[name]
+
+    def register_composition_anchor(
+        self,
+        name: str,
+        anchor_id: str,
+        piece_index: int,
+        anchor,
+        *,
+        source: str = "",
+        arrival_time: float | None = None,
+    ) -> CompositionRecheck:
+        """Add a local anchor to one piece and re-check only that range.
+
+        Pieces outside the affected range keep their previously confirmed
+        basis untouched; ranges still without anchors remain unknown.
+        """
+        scheme = self._require_composition(name)
+        if not 0 <= piece_index < len(scheme.pieces):
+            raise ValueError(f"unknown composition piece {piece_index}")
+        piece = scheme.pieces[piece_index]
+        parsed = (
+            anchor
+            if isinstance(anchor, SegmentAnchor)
+            else SegmentAnchor(*(float(value) for value in anchor))
+        )
+        self.register_anchor(
+            anchor_id,
+            scheme.sensor,
+            piece_index,
+            parsed,
+            arrival_time=arrival_time,
+            applies_to=piece.sequence_range,
+            source=source,
+        )
+        merged = tuple(sorted([*piece.anchors, parsed], key=lambda item: item.stamp))
+        anchor_ids = tuple(sorted({*piece.anchor_ids, anchor_id}))
+        pieces = list(scheme.pieces)
+        pieces[piece_index] = replace(piece, anchors=merged, anchor_ids=anchor_ids)
+        updated = replace(scheme, pieces=tuple(pieces))
+        affected = {piece_index}
+        fresh = self._composition_contradictions(updated, affected)
+        kept = tuple(
+            item
+            for item in scheme.contradictions
+            if not (set(item.piece_indices) & affected)
+        )
+        updated = replace(updated, contradictions=kept + fresh)
+        self.compositions[name] = updated
+        return CompositionRecheck(
+            name,
+            (piece.sequence_range,),
+            tuple(
+                item.sequence_range
+                for item in updated.pieces
+                if item.index != piece_index
+            ),
+            updated.contradictions,
+            self._composition_unknown_ranges(updated),
+        )
+
+    def _composition_unknown_ranges(
+        self, scheme: CompositeScheme
+    ) -> tuple[tuple[int, int], ...]:
+        """Uncovered original ranges, including beyond the outermost pieces."""
+        gaps = set(scheme.unknown_ranges())
+        sequences = [
+            item.sequence
+            for item in self.received
+            if item.sensor == scheme.sensor
+        ]
+        if sequences:
+            ordered = sorted(scheme.pieces, key=lambda item: item.sequence_range)
+            low, high = min(sequences), max(sequences)
+            if not ordered:
+                gaps.add((low, high))
+            else:
+                if low < ordered[0].sequence_range[0]:
+                    gaps.add((low, ordered[0].sequence_range[0] - 1))
+                if high > ordered[-1].sequence_range[1]:
+                    gaps.add((ordered[-1].sequence_range[1] + 1, high))
+        return tuple(sorted(gaps))
+
+    def _require_composition(self, name: str) -> CompositeScheme:
+        if name not in self.compositions:
+            raise KeyError(f"unknown composition {name!r}")
+        return self.compositions[name]
+
     # ------------------------------------------------------------- inspection
 
     def state(self) -> StateEstimate:
@@ -1052,6 +1532,7 @@ class LocalizationPipeline:
             list(self.anchor_records.values()),
             list(self.interpretations.values()),
             self.comparison_view,
+            list(self.compositions.values()),
         )
         self.checkpoints.append(checkpoint)
         return checkpoint
@@ -1125,6 +1606,14 @@ class LocalizationPipeline:
                 self.calibration,
                 self.calibration.with_reboot_clock(interp.clock),
             )
+        self.compositions = {}
+        for item in checkpoint.compositions:
+            scheme = (
+                item
+                if isinstance(item, CompositeScheme)
+                else CompositeScheme.from_dict(item)
+            )
+            self.compositions[scheme.name] = scheme
 
     def replay(self) -> list[StateEstimate]:
         if self.arrival_horizon is None:
@@ -1555,6 +2044,7 @@ class LocalizationPipeline:
                     list(self.anchor_records.values()),
                     list(self.interpretations.values()),
                     self.comparison_view,
+                    list(self.compositions.values()),
                 )
             )
 

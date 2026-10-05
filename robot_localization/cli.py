@@ -133,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         staged_sensor=checkpoint.staged_sensor,
         comparison_view=checkpoint.comparison_view,
+        compositions=checkpoint.compositions,
     )
 
     # Restore must present exactly the same visible data boundary: a message
@@ -154,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         staged_sensor=metadata["staged_sensor"],
         comparison_view=metadata["comparison_view"],
+        compositions=metadata["compositions"],
     )
     restored = LocalizationPipeline()
     restored.restore_checkpoint(loaded_checkpoint)

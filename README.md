@@ -68,6 +68,18 @@ python -m robot_localization.cli --output-dir outputs
 
 默认示例同时运行零延迟（未校正）基线与时钟校正运行，`metrics.json` 输出两者的位置 RMSE、95% 半径覆盖率、已发布重算记录、两套时钟解释的逐身份并排比较、未发布校时的撤销记录、开放区间不确定空窗以及恢复前后的可见边界；`trajectory.csv` 增加 `raw_position_error` 与 `sealed` 列。
 
+
+## 按观测范围组合候选
+
+同一传感器重启前后可能需要不同校时解释，仅选一整份候选无法表达局部可信的结果。`compose_scheme(name, sensor, pieces)` 按原始观测序号范围把多份已登记解释组合成独立的分段校时方案：每段 `CompositionPiece` 记录来源候选名、序号范围与锚点依据；段间 `CompositionBoundary` 明确记录两侧来源（`left_source` / `right_source`）、确认状态与推测窗口，绝不按当前显示时间相近就合并不同观测。组合只登记为未确认方案，不发布、不改写原始观测。
+
+- 组合前自动核对：同一段内原始戳记与校正时间随序号的单调性、范围内部是否藏着来源候选记录的重启断点、以及未确认边界两侧共同锚点的一致性。矛盾以 `CompositionContradiction` 给出具体序号区间与证据（`range_overlap` / `non_monotonic_stamp` / `non_monotonic_corrected` / `reboot_inside_piece` / `shared_anchor_conflict`），不做平滑处理；有未解决矛盾的方案不能被采用。
+- 可同时保留多份未确认方案；`compare_composition_ordering(names)` 只读地比较它们对跨传感器事件先后关系的影响（逐对列出顺序发生变化的观测及各自方案下的先后），再显式 `adopt_composition(name)` 采用其中一份。采用产生新版本，原始接收顺序与已发布结果不改写，其余方案保持未确认。
+- `register_composition_anchor(name, anchor_id, piece_index, anchor, source=...)` 局部补锚后只重新核对受影响的组合范围，返回 `CompositionRecheck`（重核范围、保留范围、当前矛盾、未知范围）；其他段的已确认依据保留，没有锚点覆盖的区间继续未知。
+- 分段来源、矛盾解释与采用决定随检查点保存（`compositions`），重开后仍对应当时的观测身份，可继续比较、补锚或采用。
+
+`tests/test_compositions.py` 覆盖来源记录、未知范围、五类矛盾区间与证据、矛盾方案禁止采用、跨传感器顺序比较、显式采用不改写原始顺序、局部补锚只重核受影响范围以及保存恢复。
+
 ## 测试
 
 ```bash
